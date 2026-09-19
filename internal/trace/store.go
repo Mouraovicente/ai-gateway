@@ -31,14 +31,26 @@ type Store interface {
 	RecordEvent(ctx context.Context, requestID string, seq int, eventType EventType, node string, payload map[string]any) error
 }
 
+// MaxPayloadBytes bounds the JSON-marshalled event payload written to
+// trace_events. A payload above this size is replaced with a small
+// truncation marker instead of failing the request.
+const MaxPayloadBytes = 64 << 10
+
+// putItemAPI is the subset of *dynamodb.Client this package needs, so tests
+// can substitute a fake without a real AWS endpoint. *dynamodb.Client
+// satisfies it.
+type putItemAPI interface {
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+}
+
 type dynamoStore struct {
-	client        *dynamodb.Client
+	client        putItemAPI
 	requestsTable string
 	eventsTable   string
 }
 
 // NewDynamoStore builds a Store backed by the requests and trace_events DynamoDB tables.
-func NewDynamoStore(client *dynamodb.Client, requestsTable, eventsTable string) Store {
+func NewDynamoStore(client putItemAPI, requestsTable, eventsTable string) Store {
 	return &dynamoStore{client: client, requestsTable: requestsTable, eventsTable: eventsTable}
 }
 
@@ -75,14 +87,23 @@ type eventItem struct {
 }
 
 func (s *dynamoStore) RecordEvent(ctx context.Context, requestID string, seq int, eventType EventType, node string, payload map[string]any) error {
-	for _, forbidden := range ForbiddenKeys {
-		if _, ok := payload[forbidden]; ok {
-			return fmt.Errorf("trace: payload contains forbidden key %q", forbidden)
+	for key := range payload {
+		if isForbidden(key) {
+			return fmt.Errorf("trace: payload contains forbidden key %q", key)
 		}
 	}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("trace: marshaling event payload: %w", err)
+	}
+	if len(payloadJSON) > MaxPayloadBytes {
+		payloadJSON, err = json.Marshal(map[string]any{
+			"truncated":      true,
+			"original_bytes": len(payloadJSON),
+		})
+		if err != nil {
+			return fmt.Errorf("trace: marshaling truncated payload marker: %w", err)
+		}
 	}
 	item, err := attributevalue.MarshalMap(eventItem{
 		RequestID: requestID,

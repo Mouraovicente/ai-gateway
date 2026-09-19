@@ -2,6 +2,7 @@ package trace
 
 import (
 	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -33,5 +34,42 @@ func TestNewLogger_DropsForbiddenKeys(t *testing.T) {
 	}
 	if !strings.Contains(output, `"status":200`) {
 		t.Fatalf("expected allowed key status to be present: %s", output)
+	}
+}
+
+func TestNewLogger_DropsForbiddenKeysCaseInsensitive(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewLogger(&buf)
+
+	logger.Info("request handled",
+		"Prompt", "must never be logged",
+		"CONTENT", "must never be logged either",
+		"status", 200,
+	)
+
+	output := buf.String()
+	if strings.Contains(output, "Prompt") || strings.Contains(output, "must never be logged") {
+		t.Fatalf("forbidden key %q leaked into log output (case-insensitive): %s", "Prompt", output)
+	}
+	if strings.Contains(output, "CONTENT") || strings.Contains(output, "either") {
+		t.Fatalf("forbidden key %q leaked into log output (case-insensitive): %s", "CONTENT", output)
+	}
+	if !strings.Contains(output, `"status":200`) {
+		t.Fatalf("expected allowed key status to be present: %s", output)
+	}
+}
+
+func TestNewLogger_DropsForbiddenKeysInNestedGroup(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewLogger(&buf)
+
+	logger.Info("x", slog.Group("meta", slog.String("prompt", "secret"), slog.String("node", "router")))
+
+	output := buf.String()
+	if strings.Contains(output, "prompt") || strings.Contains(output, "secret") {
+		t.Fatalf("forbidden key leaked into nested group output: %s", output)
+	}
+	if !strings.Contains(output, `"node":"router"`) {
+		t.Fatalf("expected allowed nested key node to be present: %s", output)
 	}
 }
