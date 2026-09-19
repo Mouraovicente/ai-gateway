@@ -339,7 +339,7 @@ services:
     volumes:
       - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards
 ```
-Nota: `deploy/otel-collector-config.yaml`, `deploy/tempo.yaml`, `deploy/prometheus.yml` e `deploy/grafana/dashboards/gateway.json` são criados na Task 12; até lá, só `gateway` e `localstack` sobem — suficiente para as tasks anteriores.
+Nota: `deploy/otel-collector-config.yaml`, `deploy/tempo.yaml`, `deploy/prometheus.yml` e `deploy/grafana/dashboards/gateway.json` são criados na Task 13; até lá, só `gateway` e `localstack` sobem — suficiente para as tasks anteriores.
 
 - [ ] **Step 11: Criar `.golangci.yml` mínimo**
 
@@ -5135,7 +5135,7 @@ _, authSpan := p.Tracer.Start(ctx, "auth")
 tenant, err := p.Auth.ResolveAPIKey(ctx, apiKey)
 authSpan.End()
 ```
-Apply the same `p.Tracer.Start(ctx, "<name>")` / `span.End()` pattern around: `budget.reserve` (the `p.Budget.Reserve` call), `route` (the `router.Resolve` call), `backend.call` (the `resilience.Call` call), `budget.settle` (the `p.Budget.Settle` call), `usage.publish` (the `p.Usage.Publish` call) — six additional child spans, matching exactly the spec's span list `auth, budget.reserve, route, backend.call, budget.settle, usage.publish`. After building the final response (success path), call `p.Metrics.RequestsTotal.Add(ctx, 1)`, `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))`, `p.Metrics.TokensTotal.Add(ctx, int64(realTokens))`; in the `all_backends_failed` path, still call `p.Metrics.RequestsTotal.Add(ctx, 1)` and `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))` (tokens stay 0). Add imports `oteltrace "go.opentelemetry.io/otel/trace"` and `"github.com/vicentemoura/ai-gateway/internal/trace"` (if not already imported for `trace.EventType`).
+Apply the same `p.Tracer.Start(ctx, "<name>")` / `span.End()` pattern around: `budget.reserve` (the `p.Budget.Reserve` call), `route` (the `router.Resolve` call), `backend.call` (the `resilience.Call` call), `budget.settle` (the `p.Budget.Settle` call), `usage.publish` (the `p.Usage.Publish` call) — five additional child spans, matching exactly the spec's span list `auth, budget.reserve, route, backend.call, budget.settle, usage.publish`. After building the final response (success path), call `p.Metrics.RequestsTotal.Add(ctx, 1)`, `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))`, `p.Metrics.TokensTotal.Add(ctx, int64(realTokens))`; in the `all_backends_failed` path, still call `p.Metrics.RequestsTotal.Add(ctx, 1)` and `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))` (tokens stay 0). Add imports `oteltrace "go.opentelemetry.io/otel/trace"` and `"github.com/vicentemoura/ai-gateway/internal/trace"` (if not already imported for `trace.EventType`).
 
 - [ ] **Step 7: Iniciar os providers em `main.go`**
 
