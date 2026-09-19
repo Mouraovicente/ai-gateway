@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Go 1.27 (instalar antes do primeiro commit); módulo `github.com/vicentemoura/ai-gateway` — placeholder confirmado/ajustado na Task 1 com `gh api user -q .login`.
+- Go 1.27 (instalar antes do primeiro commit); módulo `github.com/Mouraovicente/ai-gateway` — placeholder confirmado/ajustado na Task 1 com `gh api user -q .login`.
 - Só stdlib `net/http` com mux nativo do Go 1.22+ (`mux.HandleFunc("POST /v1/chat/completions", handler)`); proibido chi/gin/echo/qualquer router de terceiros.
 - Dependências permitidas, nenhuma outra: `github.com/aws/aws-sdk-go-v2` + `config`, `service/dynamodb`, `service/sqs`, `feature/dynamodb/attributevalue`; `go.opentelemetry.io/otel` + `sdk`, `exporters/otlp/otlptrace/otlptracehttp`, `otlpmetric`; `golang.org/x/time/rate`; `gopkg.in/yaml.v3`; `github.com/google/uuid`.
 - Testes só com `testing` + `net/http/httptest`. LocalStack via `docker compose` (nunca testcontainers). Testes de integração atrás de build tag `//go:build integration`.
@@ -666,7 +666,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 func serveFixture(t *testing.T, status int, fixturePath string) *httptest.Server {
@@ -763,7 +763,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // Client talks to Ollama's native /api/chat endpoint (not the OpenAI-compatible one).
@@ -1108,7 +1108,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 type tagsResponseBody struct {
@@ -1313,7 +1313,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/backend/ollama"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
 )
 
 func TestChatHandler_NonStreaming_ReturnsOpenAIShapedResponse(t *testing.T) {
@@ -1406,8 +1406,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/vicentemoura/ai-gateway/internal/backend/ollama"
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 type incomingMessage struct {
@@ -1515,8 +1515,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/vicentemoura/ai-gateway/internal/api"
-	"github.com/vicentemoura/ai-gateway/internal/backend/ollama"
+	"github.com/Mouraovicente/ai-gateway/internal/api"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
 )
 
 func main() {
@@ -2074,7 +2074,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // ErrTenantNotFound is returned when no tenant matches the given API key.
@@ -2160,7 +2160,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
-	"github.com/vicentemoura/ai-gateway/internal/auth"
+	"github.com/Mouraovicente/ai-gateway/internal/auth"
 )
 
 // Run with: go run scripts/seed_tenants.go
@@ -2383,7 +2383,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/google/uuid"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // ErrBudgetExceeded is returned by Reserve when the tenant's monthly budget
@@ -2424,7 +2424,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 func newTestDynamoClient(t *testing.T) *dynamodb.Client {
@@ -2685,7 +2685,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 func TestChat_Success_IncludesUsage(t *testing.T) {
@@ -2767,7 +2767,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // Client talks to OpenRouter's OpenAI-compatible /v1/chat/completions endpoint.
@@ -2956,7 +2956,7 @@ package router
 import (
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/config"
 )
 
 func testRouting() *config.Routing {
@@ -3016,8 +3016,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/vicentemoura/ai-gateway/internal/config"
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // ErrUnknownModel is returned when the requested alias (or direct backend
@@ -3075,7 +3075,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 type fakeBackend struct {
@@ -3211,7 +3211,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // ErrAllBackendsFailed is returned when every target in the cascade failed.
@@ -3519,7 +3519,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 func TestChat_Success_ParsesCandidateAndUsageMetadata(t *testing.T) {
@@ -3620,7 +3620,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/vicentemoura/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
 
 // Client talks to Gemini's generateContent / streamGenerateContent endpoints.
@@ -3859,12 +3859,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vicentemoura/ai-gateway/internal/budget"
-	"github.com/vicentemoura/ai-gateway/internal/config"
-	"github.com/vicentemoura/ai-gateway/internal/core"
-	"github.com/vicentemoura/ai-gateway/internal/ratelimit"
-	"github.com/vicentemoura/ai-gateway/internal/resilience"
-	"github.com/vicentemoura/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/budget"
+	"github.com/Mouraovicente/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
+	"github.com/Mouraovicente/ai-gateway/internal/resilience"
+	"github.com/Mouraovicente/ai-gateway/internal/trace"
 )
 
 type fakeAuth struct{ tenant core.Tenant }
@@ -4175,14 +4175,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vicentemoura/ai-gateway/internal/auth"
-	"github.com/vicentemoura/ai-gateway/internal/budget"
-	"github.com/vicentemoura/ai-gateway/internal/config"
-	"github.com/vicentemoura/ai-gateway/internal/core"
-	"github.com/vicentemoura/ai-gateway/internal/ratelimit"
-	"github.com/vicentemoura/ai-gateway/internal/resilience"
-	"github.com/vicentemoura/ai-gateway/internal/router"
-	"github.com/vicentemoura/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/auth"
+	"github.com/Mouraovicente/ai-gateway/internal/budget"
+	"github.com/Mouraovicente/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
+	"github.com/Mouraovicente/ai-gateway/internal/resilience"
+	"github.com/Mouraovicente/ai-gateway/internal/router"
+	"github.com/Mouraovicente/ai-gateway/internal/trace"
 )
 
 // Pipeline wires every module the real /v1/chat/completions handler needs.
@@ -4422,16 +4422,16 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
-	"github.com/vicentemoura/ai-gateway/internal/api"
-	"github.com/vicentemoura/ai-gateway/internal/auth"
-	"github.com/vicentemoura/ai-gateway/internal/backend/gemini"
-	"github.com/vicentemoura/ai-gateway/internal/backend/ollama"
-	"github.com/vicentemoura/ai-gateway/internal/backend/openrouter"
-	"github.com/vicentemoura/ai-gateway/internal/budget"
-	"github.com/vicentemoura/ai-gateway/internal/config"
-	"github.com/vicentemoura/ai-gateway/internal/ratelimit"
-	"github.com/vicentemoura/ai-gateway/internal/resilience"
-	"github.com/vicentemoura/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/api"
+	"github.com/Mouraovicente/ai-gateway/internal/auth"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/gemini"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
+	"github.com/Mouraovicente/ai-gateway/internal/backend/openrouter"
+	"github.com/Mouraovicente/ai-gateway/internal/budget"
+	"github.com/Mouraovicente/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
+	"github.com/Mouraovicente/ai-gateway/internal/resilience"
+	"github.com/Mouraovicente/ai-gateway/internal/trace"
 )
 
 func main() {
@@ -4909,7 +4909,7 @@ p.Usage.Publish(ctx, usage.Event{
 p.Stats.Record(body.Model, target.Model, tenant.ID, latencyMs, resp.Usage.PromptTokens+resp.Usage.CompletionTokens)
 emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID})
 ```
-Place `start := time.Now()` as the very first line inside the `http.HandlerFunc` closure in `NewPipelineChatHandler`, and add the same `p.Usage.Publish`/`emit(trace.UsagePublish, ...)` call (with `status: "error"`, `error_class: "transient"`, empty `Provider`/`Model`) right before `writeAllBackendsFailed` in the `all_backends_failed` branch, so failed requests also get a `usage_event`. Add imports `"time"`, `"github.com/vicentemoura/ai-gateway/internal/usage"`, `"github.com/vicentemoura/ai-gateway/internal/stats"`.
+Place `start := time.Now()` as the very first line inside the `http.HandlerFunc` closure in `NewPipelineChatHandler`, and add the same `p.Usage.Publish`/`emit(trace.UsagePublish, ...)` call (with `status: "error"`, `error_class: "transient"`, empty `Provider`/`Model`) right before `writeAllBackendsFailed` in the `all_backends_failed` branch, so failed requests also get a `usage_event`. Add imports `"time"`, `"github.com/Mouraovicente/ai-gateway/internal/usage"`, `"github.com/Mouraovicente/ai-gateway/internal/stats"`.
 
 - [ ] **Step 12: Adicionar `/readyz`, `/v1/models` e `/stats` em `cmd/gateway/main.go`**
 
@@ -5135,7 +5135,7 @@ _, authSpan := p.Tracer.Start(ctx, "auth")
 tenant, err := p.Auth.ResolveAPIKey(ctx, apiKey)
 authSpan.End()
 ```
-Apply the same `p.Tracer.Start(ctx, "<name>")` / `span.End()` pattern around: `budget.reserve` (the `p.Budget.Reserve` call), `route` (the `router.Resolve` call), `backend.call` (the `resilience.Call` call), `budget.settle` (the `p.Budget.Settle` call), `usage.publish` (the `p.Usage.Publish` call) — five additional child spans, matching exactly the spec's span list `auth, budget.reserve, route, backend.call, budget.settle, usage.publish`. After building the final response (success path), call `p.Metrics.RequestsTotal.Add(ctx, 1)`, `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))`, `p.Metrics.TokensTotal.Add(ctx, int64(realTokens))`; in the `all_backends_failed` path, still call `p.Metrics.RequestsTotal.Add(ctx, 1)` and `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))` (tokens stay 0). Add imports `oteltrace "go.opentelemetry.io/otel/trace"` and `"github.com/vicentemoura/ai-gateway/internal/trace"` (if not already imported for `trace.EventType`).
+Apply the same `p.Tracer.Start(ctx, "<name>")` / `span.End()` pattern around: `budget.reserve` (the `p.Budget.Reserve` call), `route` (the `router.Resolve` call), `backend.call` (the `resilience.Call` call), `budget.settle` (the `p.Budget.Settle` call), `usage.publish` (the `p.Usage.Publish` call) — five additional child spans, matching exactly the spec's span list `auth, budget.reserve, route, backend.call, budget.settle, usage.publish`. After building the final response (success path), call `p.Metrics.RequestsTotal.Add(ctx, 1)`, `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))`, `p.Metrics.TokensTotal.Add(ctx, int64(realTokens))`; in the `all_backends_failed` path, still call `p.Metrics.RequestsTotal.Add(ctx, 1)` and `p.Metrics.LatencyMs.Record(ctx, float64(latencyMs))` (tokens stay 0). Add imports `oteltrace "go.opentelemetry.io/otel/trace"` and `"github.com/Mouraovicente/ai-gateway/internal/trace"` (if not already imported for `trace.EventType`).
 
 - [ ] **Step 7: Iniciar os providers em `main.go`**
 
