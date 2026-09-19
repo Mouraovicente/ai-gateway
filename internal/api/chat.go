@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -29,9 +30,18 @@ func NewChatHandler(client *ollama.Client, model string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := RequestIDFromContext(r.Context())
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 		var body chatCompletionRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			WriteError(w, requestID, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+			status := http.StatusBadRequest
+			msg := "malformed JSON body"
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				status = http.StatusRequestEntityTooLarge
+				msg = "request body too large"
+			}
+			WriteError(w, requestID, status, "invalid_request", msg)
 			return
 		}
 		if len(body.Messages) == 0 {
@@ -83,24 +93,46 @@ func serveStream(w http.ResponseWriter, r *http.Request, client *ollama.Client, 
 	w.WriteHeader(http.StatusOK)
 
 	chunks, errs := client.ChatStream(r.Context(), model, chatReq)
-	for chunk := range chunks {
+
+	// client.ChatStream's producer goroutine also selects on ctx (r.Context()
+	// here), closes both chunks and errs when it returns, and buffers errs
+	// with capacity 1. So on cancellation it is enough to return: nothing
+	// downstream is left blocked waiting on us to drain either channel.
+loop:
+	for {
 		select {
 		case <-r.Context().Done():
 			return
-		default:
+		case chunk, ok := <-chunks:
+			if !ok {
+				break loop
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"id":      requestID,
+				"object":  "chat.completion.chunk",
+				"choices": []map[string]any{{"index": 0, "delta": map[string]string{"content": chunk.Delta}, "finish_reason": chunk.FinishReason}},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
 		}
-		payload, _ := json.Marshal(map[string]any{
-			"id":      requestID,
-			"object":  "chat.completion.chunk",
-			"choices": []map[string]any{{"index": 0, "delta": map[string]string{"content": chunk.Delta}, "finish_reason": chunk.FinishReason}},
-		})
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
 	}
-	if err := <-errs; err != nil {
-		payload, _ := json.Marshal(map[string]string{"error": err.Error()})
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
+	// chunks is closed, so errs is either already sent or will never send;
+	// read it non-blockingly rather than risk waiting forever.
+	select {
+	case err := <-errs:
+		if err != nil {
+			// Never include prompt or model output here, only the error text.
+			payload, _ := json.Marshal(map[string]any{
+				"error": map[string]string{
+					"type":       "backend_stream_failed",
+					"message":    err.Error(),
+					"request_id": requestID,
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
+		}
+	default:
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()

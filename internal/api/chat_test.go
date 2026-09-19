@@ -1,12 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
 )
@@ -85,5 +87,85 @@ func TestChatHandler_Streaming_EmitsSSEWithDoneSentinel(t *testing.T) {
 	last := events[len(events)-1]
 	if last != "data: [DONE]" {
 		t.Fatalf("expected last SSE event to be the DONE sentinel, got %q", last)
+	}
+}
+
+func TestChatHandler_MalformedJSON_Returns400(t *testing.T) {
+	client := ollama.NewClient("http://unused.invalid")
+	handler := RequestIDMiddleware(NewChatHandler(client, "qwen2.5-coder:1.5b"))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var parsed struct {
+		Error struct {
+			Type      string `json:"type"`
+			RequestID string `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("parsing error body: %v", err)
+	}
+	if parsed.Error.Type != "invalid_request" || parsed.Error.RequestID == "" {
+		t.Fatalf("unexpected error body: %+v", parsed)
+	}
+}
+
+func TestChatHandler_EmptyMessages_Returns400(t *testing.T) {
+	client := ollama.NewClient("http://unused.invalid")
+	handler := RequestIDMiddleware(NewChatHandler(client, "qwen2.5-coder:1.5b"))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","messages":[]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatHandler_ClientCancelMidStream_ReturnsPromptly(t *testing.T) {
+	backendSawCancel := make(chan struct{}, 1)
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Write([]byte(`{"message":{"role":"assistant","content":"hi"},"done":false}` + "\n"))
+		flusher.Flush()
+		<-r.Context().Done()
+		backendSawCancel <- struct{}{}
+	}))
+	defer ollamaSrv.Close()
+
+	client := ollama.NewClient(ollamaSrv.URL)
+	handler := RequestIDMiddleware(NewChatHandler(client, "qwen2.5-coder:1.5b"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reqBody := `{"model":"nuva/fast","stream":true,"messages":[{"role":"user","content":"oi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Let the first chunk flow, then cancel like a disconnected client.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler did not return within 2s of client cancel")
+	}
+
+	select {
+	case <-backendSawCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("backend request did not observe context cancellation")
 	}
 }
