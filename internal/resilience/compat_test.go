@@ -1,6 +1,7 @@
 package resilience
 
 import (
+	"github.com/Mouraovicente/ai-gateway/internal/backend/gemini"
 	"github.com/Mouraovicente/ai-gateway/internal/backend/ollama"
 	"github.com/Mouraovicente/ai-gateway/internal/backend/openrouter"
 )
@@ -11,4 +12,5 @@ import (
 var (
 	_ FullBackend = (*ollama.Client)(nil)
 	_ FullBackend = (*openrouter.Client)(nil)
+	_ FullBackend = (*gemini.Client)(nil)
 )
