@@ -77,12 +77,13 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 	}
-	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", c.baseURL, model, c.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", c.baseURL, model)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: building request: %w", err)}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -131,13 +132,14 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 			return
 		}
-		url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", c.baseURL, model, c.apiKey)
+		url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", c.baseURL, model)
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: building request: %w", err)}
 			return
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
 		resp, err := c.http.Do(httpReq)
 		if err != nil {

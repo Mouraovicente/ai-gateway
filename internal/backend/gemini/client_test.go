@@ -22,8 +22,11 @@ func TestChat_Success_ParsesCandidateAndUsageMetadata(t *testing.T) {
 		if !strings.Contains(r.URL.Path, "generateContent") {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		if r.URL.Query().Get("key") != "test-key" {
-			t.Fatalf("expected key=test-key query param, got %q", r.URL.RawQuery)
+		if r.URL.Query().Get("key") != "" {
+			t.Fatalf("api key must not be sent in the URL query, got %q", r.URL.RawQuery)
+		}
+		if r.Header.Get("x-goog-api-key") != "test-key" {
+			t.Fatalf("expected x-goog-api-key header, got %q", r.Header.Get("x-goog-api-key"))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(fixture)
@@ -56,6 +59,12 @@ func TestChatStream_EmitsDeltasThenFinalUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.URL.Path, "streamGenerateContent") {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("key") != "" {
+			t.Fatalf("api key must not be sent in the URL query, got %q", r.URL.RawQuery)
+		}
+		if r.Header.Get("x-goog-api-key") != "test-key" {
+			t.Fatalf("expected x-goog-api-key header, got %q", r.Header.Get("x-goog-api-key"))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Write(fixture)
