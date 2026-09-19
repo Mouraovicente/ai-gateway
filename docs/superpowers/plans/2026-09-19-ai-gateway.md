@@ -20,7 +20,7 @@
 - `internal/core` guarda os tipos compartilhados: `ChatRequest`, `Message`, `ChatChunk`, `ChatResponse`, `Usage`, `BackendTarget`, `Tenant`, `Reservation`, erro tipado `BackendError{Class ErrorClass (Transient|Permanent), Status int, Err error}`.
 - Logger: `log/slog` com handler JSON e `ReplaceAttr` que descarta as chaves proibidas `message, messages, answer, trace, content, payload, prompt, completion`; lista exportada `trace.ForbiddenKeys`; teste garante que nenhuma delas sai no log.
 - `X-Request-Id`: uuid v4 gerado em middleware, devolvido no header de resposta e no campo `request_id` de todo corpo de erro `{ "error": { "type": "...", "message": "...", "request_id": "..." } }`.
-- Budget: DynamoDB `UpdateItem` com `ConditionExpression "attribute_not_exists(used) OR used + :est <= :limit"` e `ADD used :est`; `settle` faz `ADD used :delta` (delta = real - estimado, pode ser negativo). Reserva registrada em item com TTL de 15 min; `settle` apaga o item de reserva.
+- Budget: DynamoDB `UpdateItem` com `ConditionExpression "attribute_not_exists(used) OR used <= :maxAllowed"` e `ADD used :est` (`:maxAllowed` = limite − estimado, precomputado: DynamoDB não aceita aritmética em ConditionExpression); `settle` faz `ADD used :delta` (delta = real - estimado, pode ser negativo). Reserva registrada em item com TTL de 15 min; `settle` apaga o item de reserva.
 - Rate limit: `golang.org/x/time/rate`, um `*rate.Limiter` por tenant guardado em `sync.Map`; `Retry-After` inteiro em segundos.
 - Retry: máximo 2 tentativas por backend, backoff 200ms×2^n com jitter, só para `ErrorClass == Transient`; depois passa para o próximo target da cascata; se todos falharem, `502` `all_backends_failed` com lista `attempts` no corpo.
 - SSE: `Content-Type: text/event-stream`; cada chunk `data: {json}\n\n`; terminar com `data: [DONE]\n\n`; `http.Flusher` após cada chunk; respeitar `r.Context().Done()` — nesse caso `settle` com tokens parciais e `trace_event` tipo `error` com `reason: client_closed`.
@@ -2551,7 +2551,7 @@ func (s *dynamoStore) Reserve(ctx context.Context, tenantID, period string, esti
 		TableName:                 &s.budgetsTable,
 		Key:                       key,
 		UpdateExpression:          strPtr("ADD used :est"),
-		ConditionExpression:       strPtr("attribute_not_exists(used) OR used + :est <= :limit"),
+		ConditionExpression:       strPtr("attribute_not_exists(used) OR used <= :maxAllowed"),
 		ExpressionAttributeValues: exprValues,
 	})
 	if err != nil {
