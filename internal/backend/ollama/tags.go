@@ -30,7 +30,11 @@ func (c *Client) Tags(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, &core.BackendError{Class: core.Transient, Status: resp.StatusCode, Err: fmt.Errorf("ollama: tags returned %d", resp.StatusCode)}
+		class := core.Permanent
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			class = core.Transient
+		}
+		return nil, &core.BackendError{Class: class, Status: resp.StatusCode, Err: fmt.Errorf("ollama: tags returned %d", resp.StatusCode)}
 	}
 
 	var parsed tagsResponseBody

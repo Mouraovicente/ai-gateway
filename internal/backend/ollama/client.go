@@ -154,12 +154,15 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 				return
 			}
 			if parsed.Done {
-				chunks <- core.ChatChunk{
+				select {
+				case chunks <- core.ChatChunk{
 					FinishReason: parsed.DoneReason,
 					Usage: &core.Usage{
 						PromptTokens:     parsed.PromptEvalCount,
 						CompletionTokens: parsed.EvalCount,
 					},
+				}:
+				case <-ctx.Done():
 				}
 				return
 			}

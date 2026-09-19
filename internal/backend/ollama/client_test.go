@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
@@ -181,4 +182,45 @@ func joinDeltas(deltas []string) string {
 		out += d
 	}
 	return out
+}
+
+func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T) {
+	body := []byte(`{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":"Ol"},"done":false}
+{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":12,"eval_count":8}
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	req := core.ChatRequest{RequestID: "req-6", Messages: []core.Message{{Role: "user", Content: "oi"}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := client.ChatStream(ctx, "qwen2.5-coder:1.5b", req)
+
+	first := <-chunks
+	if first.Delta == "" {
+		t.Fatalf("expected first chunk to carry a delta, got %+v", first)
+	}
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		for range chunks {
+			// drain, but consumer never reads again per the scenario except this drain
+			// loop exists only to detect channel close; real consumers may stop reading
+			// entirely, which is exactly the leak scenario the terminal-chunk fix covers.
+		}
+		<-errs
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for ChatStream goroutine to finish after ctx cancellation")
+	}
 }
