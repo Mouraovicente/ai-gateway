@@ -1,0 +1,42 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+      - uses: gitleaks/gitleaks-action@v2
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - run: docker compose up -d localstack
+      - run: go test -tags integration ./...
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+
+  terraform-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install terraform-local
+      - uses: hashicorp/setup-terraform@v3
+      - run: docker compose up -d localstack
+      - working-directory: infra
+        run: tflocal init && tflocal plan

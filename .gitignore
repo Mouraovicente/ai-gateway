@@ -1,0 +1,7 @@
+/ai-gateway
+*.exe
+.env
+.superpowers/
+bin/
+.terraform/
+*.tfstate*
