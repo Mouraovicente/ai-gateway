@@ -5,3 +5,7 @@
 bin/
 .terraform/
 *.tfstate*
+
+# terraform
+infra/**/.terraform/
+infra/**/*.tfstate*
