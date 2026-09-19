@@ -3687,7 +3687,7 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 	}
-	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", c.baseURL, model, c.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", c.baseURL, model) // API key goes in the x-goog-api-key header, never in the URL
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: building request: %w", err)}
@@ -3741,7 +3741,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 			return
 		}
-		url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", c.baseURL, model, c.apiKey)
+		url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", c.baseURL, model) // API key goes in the x-goog-api-key header, never in the URL
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: building request: %w", err)}
@@ -3809,12 +3809,12 @@ Expected: PASS nos dois casos.
 
 Run:
 ```bash
-curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=$GEMINI_API_KEY" \
+curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent" -H "x-goog-api-key: $GEMINI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"role":"user","parts":[{"text":"oi"}]}]}' \
   | tee internal/backend/gemini/testdata/generate_success.json
 
-curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent?alt=sse&key=$GEMINI_API_KEY" \
+curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent?alt=sse" -H "x-goog-api-key: $GEMINI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"role":"user","parts":[{"text":"oi"}]}]}' \
   | tee internal/backend/gemini/testdata/generate_stream.ndjson
