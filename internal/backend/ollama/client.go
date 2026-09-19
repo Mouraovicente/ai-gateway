@@ -36,6 +36,18 @@ type chatResponseBody struct {
 	Error           string       `json:"error"`
 }
 
+// errMessage extracts Ollama's {"error": "..."} message from an error
+// response body, falling back to the raw body when it doesn't parse as that shape.
+func errMessage(raw []byte) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &body); err == nil && body.Error != "" {
+		return body.Error
+	}
+	return string(raw)
+}
+
 // Chat performs a single non-streaming call to Ollama's /api/chat.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
 	body, err := json.Marshal(chatRequestBody{Model: model, Messages: req.Messages, Stream: false})
@@ -61,15 +73,21 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	}
 
 	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Status: resp.StatusCode, Err: fmt.Errorf("ollama: %s", string(raw))}
+		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Status: resp.StatusCode, Err: fmt.Errorf("ollama: %s", errMessage(raw))}
 	}
 	if resp.StatusCode >= 400 {
-		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Status: resp.StatusCode, Err: fmt.Errorf("ollama: %s", string(raw))}
+		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Status: resp.StatusCode, Err: fmt.Errorf("ollama: %s", errMessage(raw))}
 	}
 
 	var parsed chatResponseBody
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: parsing response: %w", err)}
+	}
+	if parsed.Error != "" {
+		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Status: resp.StatusCode, Err: fmt.Errorf("ollama: %s", parsed.Error)}
+	}
+	if !parsed.Done {
+		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Status: resp.StatusCode, Err: fmt.Errorf("ollama: response not done")}
 	}
 
 	return core.ChatResponse{

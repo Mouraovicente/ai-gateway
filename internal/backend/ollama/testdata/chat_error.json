@@ -1,3 +1,1 @@
-{
-  "error": "model \"does-not-exist\" not found, try pulling it first"
-}
+{"error":"model 'model-that-does-not-exist:latest' not found"}
