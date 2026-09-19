@@ -102,8 +102,6 @@ func serveStream(w http.ResponseWriter, r *http.Request, client *ollama.Client, 
 		fmt.Fprintf(w, "data: %s\n\n", payload)
 		flusher.Flush()
 	}
-	// A single trailing newline (not the usual "\n\n" separator) keeps this
-	// the final scannable line for clients reading the body line-by-line.
-	fmt.Fprint(w, "data: [DONE]\n")
+	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }

@@ -1,8 +1,6 @@
 package api
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -75,13 +73,17 @@ func TestChatHandler_Streaming_EmitsSSEWithDoneSentinel(t *testing.T) {
 		t.Fatalf("expected text/event-stream, got %q", ct)
 	}
 
-	scanner := bufio.NewScanner(bytes.NewReader(rec.Body.Bytes()))
-	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+	body := rec.Body.String()
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("expected body to end with the DONE sentinel event, got %q", body)
 	}
-	last := lines[len(lines)-1]
+
+	// SSE events are separated by a blank line ("\n\n"); split on that
+	// boundary rather than by line, and drop the trailing empty element left
+	// by the final event's closing blank line.
+	events := strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n")
+	last := events[len(events)-1]
 	if last != "data: [DONE]" {
-		t.Fatalf("expected last SSE line to be the DONE sentinel, got %q", last)
+		t.Fatalf("expected last SSE event to be the DONE sentinel, got %q", last)
 	}
 }
