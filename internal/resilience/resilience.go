@@ -83,17 +83,27 @@ func Call(ctx context.Context, backends map[string]Backend, targets []core.Backe
 			if attempt == maxAttemptsPerBackend-1 {
 				break // exhausted retries on this backend, move to next target
 			}
-			backoff(attempt)
+			if err := backoff(ctx, attempt); err != nil {
+				return core.ChatResponse{}, core.BackendTarget{}, attempts, fmt.Errorf("resilience: cancelled during backoff: %w", err)
+			}
 		}
 	}
 
 	return core.ChatResponse{}, core.BackendTarget{}, attempts, ErrAllBackendsFailed
 }
 
-func backoff(attempt int) {
+// backoff sleeps for 200ms*2^attempt plus jitter, or returns ctx.Err() if
+// the context is cancelled first, so a client disconnect during a retry
+// wait doesn't leave the call blocked for the full backoff window.
+func backoff(ctx context.Context, attempt int) error {
 	base := 200 * time.Millisecond * time.Duration(1<<attempt)
 	jitter := time.Duration(rand.Int63n(int64(base / 2)))
-	time.Sleep(base + jitter)
+	select {
+	case <-time.After(base + jitter):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // CallStream tries each target's ChatStream in order. Before the first
@@ -140,7 +150,9 @@ func CallStream(ctx context.Context, targets []core.BackendTarget, resolve func(
 			if attempt == maxAttemptsPerBackend-1 {
 				break // exhausted retries on this backend before first byte: move to next target
 			}
-			backoff(attempt)
+			if err := backoff(ctx, attempt); err != nil {
+				return core.Usage{}, attempts, fmt.Errorf("resilience: cancelled during backoff: %w", err)
+			}
 		}
 	}
 

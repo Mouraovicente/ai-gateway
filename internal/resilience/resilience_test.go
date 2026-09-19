@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
@@ -166,5 +167,32 @@ func TestCallStream_SucceedsOnFirstTarget(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].Status != 200 {
 		t.Fatalf("unexpected attempts: %+v", attempts)
+	}
+}
+
+func TestCall_CancelledDuringBackoff_ReturnsContextCanceled(t *testing.T) {
+	transientErr := &core.BackendError{Class: core.Transient, Status: 503, Err: errors.New("unavailable")}
+	ollama := &fakeBackend{results: []struct {
+		resp core.ChatResponse
+		err  error
+	}{{err: transientErr}, {err: transientErr}}}
+	backends := map[string]Backend{"ollama": ollama}
+	targets := []core.BackendTarget{{Provider: "ollama", Model: "m1"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, _, _, err := Call(ctx, backends, targets, core.ChatRequest{})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("expected Call to return promptly after cancellation, took %v", elapsed)
 	}
 }
