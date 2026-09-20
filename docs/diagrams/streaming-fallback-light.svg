@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 360" width="1000" height="360" role="img" aria-label="In a streaming request the gateway may retry and fall back to the next target only until the first delta byte reaches the client; after that a failure becomes an in-band SSE backend_stream_failed event and the stream ends on the same target." font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#1f2328"/>
+    </marker>
+    <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#57606a"/>
+    </marker>
+    <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#0969da"/>
+    </marker>
+  </defs>
+  <line x1="560" y1="46" x2="560" y2="300" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="560" y="38" font-size="11.5" fill="#0969da" text-anchor="middle">first delta byte reaches client</text>
+  <text x="300" y="66" font-size="11.5" fill="#57606a" text-anchor="middle">retry and fallback allowed</text>
+  <text x="772" y="66" font-size="11.5" fill="#57606a" text-anchor="middle">no target switch</text>
+  <text x="84" y="122" font-size="11.5" fill="#57606a" text-anchor="end">T1 ollama</text>
+  <line x1="92" y1="118" x2="946" y2="118" stroke="#57606a" stroke-width="1" stroke-dasharray="2 5"/>
+  <text x="84" y="174" font-size="11.5" fill="#57606a" text-anchor="end">T2 openrouter</text>
+  <line x1="92" y1="170" x2="946" y2="170" stroke="#57606a" stroke-width="1" stroke-dasharray="2 5"/>
+  <text x="84" y="226" font-size="11.5" fill="#57606a" text-anchor="end">T3 gemini</text>
+  <line x1="92" y1="222" x2="946" y2="222" stroke="#57606a" stroke-width="1" stroke-dasharray="2 5"/>
+  <rect x="100" y="88" width="116" height="34" rx="6" fill="#f6f8fa" stroke="#1f2328" stroke-width="1.5"/>
+  <text x="158" y="110" font-size="11" fill="#1f2328" text-anchor="middle">attempt 1</text>
+  <rect x="228" y="88" width="106" height="34" rx="6" fill="#f6f8fa" stroke="#1f2328" stroke-width="1.5"/>
+  <text x="281" y="110" font-size="11" fill="#1f2328" text-anchor="middle">retry</text>
+  <text x="281" y="80" font-size="10.5" fill="#57606a" text-anchor="middle">transient error</text>
+  <polyline points="334,105 346,105 346,157 356,157" fill="none" stroke="#1f2328" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="352" y="136" font-size="10.5" fill="#57606a" text-anchor="start">falls back</text>
+  <rect x="358" y="140" width="122" height="34" rx="6" fill="#f6f8fa" stroke="#1f2328" stroke-width="1.5"/>
+  <text x="419" y="162" font-size="11" fill="#1f2328" text-anchor="middle">attempt 1</text>
+  <text x="492" y="162" font-size="10.5" fill="#57606a" text-anchor="start">permanent</text>
+  <polyline points="480,157 492,157 492,209 502,209" fill="none" stroke="#1f2328" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="486" y="188" font-size="10.5" fill="#57606a" text-anchor="end">falls back</text>
+  <rect x="504" y="192" width="300" height="34" rx="6" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+  <text x="654" y="214" font-size="11" fill="#0969da" text-anchor="middle">streams deltas to the client</text>
+  <line x1="816" y1="199" x2="836" y2="219" stroke="#1f2328" stroke-width="2"/>
+  <line x1="836" y1="199" x2="816" y2="219" stroke="#1f2328" stroke-width="2"/>
+  <text x="848" y="214" font-size="11" fill="#1f2328" text-anchor="start">backend fails</text>
+  <line x1="826" y1="226" x2="826" y2="258" stroke="#1f2328" stroke-width="1.5" marker-end="url(#a)"/>
+  <rect x="600" y="260" width="346" height="44" rx="6" fill="#eaeef2" stroke="#1f2328" stroke-width="1.5"/>
+  <text x="773" y="278" font-size="11" fill="#1f2328" text-anchor="middle">SSE event backend_stream_failed, then [DONE]</text>
+  <text x="773" y="294" font-size="10.5" fill="#57606a" text-anchor="middle">same target, stream ends</text>
+  <rect x="60" y="260" width="470" height="44" rx="6" fill="#eaeef2" stroke="#1f2328" stroke-width="1.5"/>
+  <text x="295" y="278" font-size="11" fill="#1f2328" text-anchor="middle">error before the first byte → next target in the cascade</text>
+  <text x="295" y="294" font-size="10.5" fill="#57606a" text-anchor="middle">retry cap: 2 attempts per backend</text>
+  <rect x="60" y="318" width="886" height="32" rx="6" fill="#f6f8fa" stroke="#1f2328" stroke-width="1.2" stroke-dasharray="5 4"/>
+  <text x="503" y="338" font-size="11" fill="#57606a" text-anchor="middle">budget.settle runs on every path, charging the tokens actually streamed (partial counts)</text>
+</svg>
