@@ -9,13 +9,9 @@ tags:
   - ai-infra
   - arquitetura
 sources:
-  - Projetos/Portfólio AI Infra/00 - Portfólio AI Infra.md
-  - Projetos/Portfólio AI Infra/Backlog — 15 projetos de AI Infra (Suraj Sharma).md
-  - Conhecimento/Pós IA Aplicada/Módulo 02 - Integração com APIs de LLMs/01 - Gateway Roteador de Modelos (OpenRouter).md
-  - Conhecimento/Pós IA Aplicada/Módulo 03 - MCP/07 - Segurança de API - Auth e Rate Limiting no MCP.md
-  - Conhecimento/Pós IA Aplicada/Módulo 08 - TrialForge/05 - Arquitetura Enterprise - Observabilidade, Implantação Híbrida e Model Tiering.md
-  - Conhecimento/Pós IA Aplicada/Módulo 04b - OpsPilot/07 - Observabilidade e Limites de Autonomia.md
-  - Conhecimento/Infra e Padrões/Proposta — Padrões extraídos da Pós IA Aplicada.md
+  - Portfolio reference project: AI Infrastructure foundational concepts
+  - Course notes (University Specialization: Applied AI Engineering Post-Grad): API gateway routing, model selection, auth and rate limiting, model tiering, enterprise observability
+  - Internal design notes for the portfolio (private)
 ---
 # Arquitetura — ai-gateway
 
@@ -51,7 +47,7 @@ Volume: portfólio. Dezenas de req/s no load test (repo 2), unidades em uso norm
 
 Orçamento de operação: zero até deploy real. LocalStack Community, Ollama local, OpenRouter só com chave e teto de gasto configurado na conta.
 
-O que já existe: Docker Desktop, Go 1.23.2 (Windows), Ollama com `qwen2.5-coder:1.5b`, `phi4-mini`, `gemma4-coder`; LiteLLM rodando em `nuvatech_dev_litellm` (referência de comportamento, não dependência); `gh` autenticado. Faltam: Terraform, `tflocal`, `awscli-local`, Podman (não necessário neste repo). Go precisa subir para a versão estável atual antes do primeiro commit.
+O que já existe: Docker Desktop, Go (atualizado para 1.27 antes do bootstrap), Ollama com modelos locais pequenos, gh autenticado. Faltavam Terraform, tflocal e awscli-local, instalados na Task 0.
 
 Suposições:
 - S1. Tokens estimados no `reserve` = `len(prompt_bytes)/4 + max_tokens` (ou 1024 se ausente). Acerto no `settle` com `usage` do provedor; Ollama devolve `prompt_eval_count`/`eval_count`; OpenRouter exige `stream_options.include_usage: true` no streaming.
