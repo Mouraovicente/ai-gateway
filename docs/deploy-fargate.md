@@ -5,8 +5,22 @@ Este documento cobre o `apply` real, feito manualmente contra uma conta AWS de v
 ## Pré-requisitos
 
 1. Conta AWS real com credenciais configuradas (`aws configure` ou variáveis `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).
-2. Uma VPC com ao menos duas subnets (idealmente públicas, para o ALB) e um security group liberando a porta 8080 de dentro da VPC e a 80 de fora — pode ser a VPC default da conta.
+2. Uma VPC com ao menos duas subnets (idealmente públicas, para o ALB) e um security group liberando a porta 8080 de dentro da VPC e a 443 de fora — pode ser a VPC default da conta.
 3. Um repositório ECR para a imagem do gateway.
+4. Um certificado ACM para o domínio do gateway, **na mesma região** do ALB (`us-east-1` nos exemplos abaixo — ACM é regional, um certificado emitido em outra região não aparece como opção pro listener HTTPS). Peça e valide por DNS antes do apply:
+
+   ```bash
+   aws acm request-certificate \
+     --domain-name gateway.example.com \
+     --validation-method DNS \
+     --region us-east-1
+   # anote o CertificateArn retornado, e o(s) registro(s) CNAME de validação
+   # (aws acm describe-certificate --certificate-arn <arn> --region us-east-1)
+   # crie o(s) CNAME(s) no seu provedor de DNS e espere o status virar ISSUED:
+   aws acm wait certificate-validated --certificate-arn <arn> --region us-east-1
+   ```
+
+   O ALB (`infra/modules/ecs_fargate`) sempre termina TLS: o listener HTTPS:443 exige esse certificado (`acm_certificate_arn`), e o listener HTTP:80 só existe para redirecionar 301 pra HTTPS — não há fallback HTTP puro. `enable_fargate=true` sem `acm_certificate_arn` falha o apply.
 
 ## Build e push da imagem para o ECR
 
@@ -57,6 +71,7 @@ A execution role do módulo já tem permissão `secretsmanager:GetSecretValue` r
      -var enable_fargate=true \
      -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
      -var ecr_repository_arn=arn:aws:ecr:us-east-1:<account-id>:repository/ai-gateway \
+     -var acm_certificate_arn=arn:aws:acm:us-east-1:<account-id>:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
      -var vpc_id=vpc-xxxxxxxx \
      -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
      -var 'security_group_ids=["sg-xxxxxxxx"]' \
@@ -64,7 +79,7 @@ A execution role do módulo já tem permissão `secretsmanager:GetSecretValue` r
    terraform apply plan.tfplan
    ```
 
-   `ecr_repository_arn` é obrigatório junto com `enable_fargate=true`: scopa a permissão de pull de imagem da execution role a esse repositório específico, em vez de `Resource = "*"`.
+   `ecr_repository_arn` e `acm_certificate_arn` são obrigatórios junto com `enable_fargate=true`: o primeiro escopa a permissão de pull de imagem da execution role a esse repositório específico (em vez de `Resource = "*"`); o segundo é o certificado que o listener HTTPS:443 do ALB termina — sem ele o apply falha.
 
 3. Pegue o DNS do ALB no output `alb_dns_name` do módulo (`terraform output -module=gateway_service` ou o output do apply) e confirme o serviço de pé:
 
@@ -88,6 +103,7 @@ terraform destroy \
   -var enable_fargate=true \
   -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
   -var ecr_repository_arn=arn:aws:ecr:us-east-1:<account-id>:repository/ai-gateway \
+  -var acm_certificate_arn=arn:aws:acm:us-east-1:<account-id>:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   -var vpc_id=vpc-xxxxxxxx \
   -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
   -var 'security_group_ids=["sg-xxxxxxxx"]'
@@ -97,3 +113,4 @@ terraform destroy \
 
 - LocalStack Community não simula ECS/ALB/IAM com fidelidade suficiente para validar esses recursos — por isso o CI só roda `tflocal plan` com `enable_fargate=false` (só DynamoDB + SQS) e uma validação estrutural (`terraform validate -var enable_fargate=true`), sem `plan`/`apply` contra LocalStack.
 - Este repo não provisiona VPC/subnets/security group — assume-se que já existem na conta (passe os IDs via `-var`).
+- Este repo também não provisiona o certificado ACM nem os registros DNS de validação — peça e valide manualmente (seção Pré-requisitos) antes do apply.

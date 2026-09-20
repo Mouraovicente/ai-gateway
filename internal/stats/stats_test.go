@@ -88,6 +88,27 @@ func TestRecorder_EvictsSamplesOlderThanWindow(t *testing.T) {
 	}
 }
 
+func TestRecorder_EvictsKeyEntirelyWhenAllSamplesExpire(t *testing.T) {
+	r := NewInMemoryRecorder(10 * time.Millisecond)
+	ir := r.(*inMemoryRecorder)
+	r.Record("nuva/fast", "m1", "tenant-1", 10, 5)
+	time.Sleep(20 * time.Millisecond)
+
+	// Snapshot triggers eviction of every key, including ones with no new
+	// samples recorded since expiring.
+	report := r.Snapshot("tenant-1")
+	if _, ok := report.Routes["nuva/fast/m1"]; ok {
+		t.Fatalf("expected expired route to disappear from snapshot, got %+v", report.Routes)
+	}
+
+	ir.mu.Lock()
+	_, exists := ir.samples[key{route: "nuva/fast", model: "m1", tenant: "tenant-1"}]
+	ir.mu.Unlock()
+	if exists {
+		t.Fatalf("expected map entry for expired key to be deleted, not just emptied")
+	}
+}
+
 func TestRecorder_CapsSamplesPerKey(t *testing.T) {
 	r := NewInMemoryRecorder(0)
 	ir := r.(*inMemoryRecorder)

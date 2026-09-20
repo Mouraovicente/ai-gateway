@@ -98,6 +98,11 @@ func (r *inMemoryRecorder) evictLocked(k key) {
 	for i < len(s) && s[i].at.Before(cutoff) {
 		i++
 	}
+	remaining := len(s) - i
+	if remaining == 0 {
+		delete(r.samples, k)
+		return
+	}
 	if i > 0 {
 		r.samples[k] = append([]sample(nil), s[i:]...)
 	}
@@ -130,7 +135,8 @@ func (r *inMemoryRecorder) Snapshot(tenantID string) Report {
 		}
 		if tenantID == "" {
 			label := strings.Join([]string{k.route, k.model, k.tenant}, "/")
-			report.Routes[label] = routeStatsFromSamples(sampleValues(samples))
+			latencies, tokens := sampleValues(samples)
+			report.Routes[label] = routeStats(latencies, tokens)
 		}
 	}
 	for label, latencies := range tenantLatencies {
@@ -148,10 +154,6 @@ func sampleValues(samples []sample) ([]int, []int) {
 		tokens[i] = s.tokens
 	}
 	return latencies, tokens
-}
-
-func routeStatsFromSamples(latencies, tokens []int) RouteStats {
-	return routeStats(latencies, tokens)
 }
 
 func routeStats(latencies, tokens []int) RouteStats {

@@ -4,6 +4,7 @@ package budget
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -68,6 +69,21 @@ func TestReserve_RejectsWhenOverBudget(t *testing.T) {
 	}
 	if _, err := store.Reserve(ctx, tenantID, "2026-09", 200, 1000); err != ErrBudgetExceeded {
 		t.Fatalf("expected ErrBudgetExceeded, got %v", err)
+	}
+}
+
+func TestReserve_RejectsSingleRequestOverBudget(t *testing.T) {
+	client := newTestDynamoClient(t)
+	store := NewDynamoStore(client, "budgets", "reservations")
+	ctx := context.Background()
+	tenantID := uniqueTenantID("tenant-budget-test-single-over")
+
+	if _, err := store.Reserve(ctx, tenantID, "2026-09", 2000, 1000); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("expected ErrBudgetExceeded, got %v", err)
+	}
+
+	if _, err := store.Reserve(ctx, tenantID, "2026-09", 500, 1000); err != nil {
+		t.Fatalf("Reserve within budget should succeed: %v", err)
 	}
 }
 

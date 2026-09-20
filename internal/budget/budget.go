@@ -108,12 +108,17 @@ func (s *dynamoStore) Reserve(ctx context.Context, tenantID, period string, esti
 		// upstream via the returned error's wrapping.
 		negValues, mErr := attributevalue.MarshalMap(map[string]any{":negEst": -estimatedTokens})
 		if mErr == nil {
-			_, _ = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			// Use a detached context so a client disconnect (ctx canceled)
+			// can't abort the compensation and leave the budget hold
+			// orphaned; bound it with a short timeout so it can't hang.
+			compensateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_, _ = s.client.UpdateItem(compensateCtx, &dynamodb.UpdateItemInput{
 				TableName:                 &s.budgetsTable,
 				Key:                       key,
 				UpdateExpression:          strPtr("ADD used :negEst"),
 				ExpressionAttributeValues: negValues,
 			})
+			cancel()
 		}
 		return core.Reservation{}, fmt.Errorf("budget: recording reservation: %w", err)
 	}

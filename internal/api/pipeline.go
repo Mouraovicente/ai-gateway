@@ -157,7 +157,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		}
 		maxTokens := 0
 		if body.MaxTokens != nil {
-			if *body.MaxTokens <= 0 || *body.MaxTokens > 32768 {
+			if *body.MaxTokens <= 0 || *body.MaxTokens > maxTokensLimit {
 				writeErr(http.StatusBadRequest, "invalid_request", "max_tokens must be between 1 and 32768")
 				return
 			}
