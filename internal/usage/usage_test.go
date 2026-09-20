@@ -5,8 +5,10 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -37,9 +39,12 @@ func TestPublish_SendsEventVersionOneJSON(t *testing.T) {
 	client, queueURL := newTestSQSClient(t)
 	publisher := NewSQSPublisher(client, queueURL)
 
+	// RequestID is unique per run so this test can never be confused by a
+	// leftover message from a previous run, a smoke test, or another test
+	// sharing the same LocalStack queue.
 	event := Event{
 		EventVersion:     1,
-		RequestID:        "req-1",
+		RequestID:        fmt.Sprintf("req-%d", time.Now().UnixNano()),
 		TenantID:         "tenant-1",
 		Tier:             "free",
 		Alias:            "nuva/fast",
@@ -55,32 +60,44 @@ func TestPublish_SendsEventVersionOneJSON(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	recv, err := client.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
-		QueueUrl:            &queueURL,
-		MaxNumberOfMessages: 1,
-		WaitTimeSeconds:     5,
-	})
-	if err != nil {
-		t.Fatalf("ReceiveMessage: %v", err)
+	// The queue may hold leftover messages from a previous run, a smoke
+	// test, or another test sharing the same LocalStack instance, so scan
+	// (and drain) several receives looking for the one matching this run's
+	// unique RequestID rather than trusting the very first message back.
+	var got Event
+	found := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !found {
+		recv, err := client.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
+			QueueUrl:            &queueURL,
+			MaxNumberOfMessages: 10,
+			WaitTimeSeconds:     2,
+		})
+		if err != nil {
+			t.Fatalf("ReceiveMessage: %v", err)
+		}
+		for _, m := range recv.Messages {
+			var candidate Event
+			if err := json.Unmarshal([]byte(*m.Body), &candidate); err == nil && candidate.RequestID == event.RequestID {
+				got = candidate
+				found = true
+			}
+			// Drain every message seen (matching or not) so a leftover
+			// message never blocks a later run either.
+			client.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
+				QueueUrl:      &queueURL,
+				ReceiptHandle: m.ReceiptHandle,
+			})
+		}
 	}
-	if len(recv.Messages) == 0 {
-		t.Fatalf("expected to receive the published message back, got none")
+	if !found {
+		t.Fatalf("expected to receive the published message (request_id=%s) back, got none", event.RequestID)
 	}
 
-	var got Event
-	if err := json.Unmarshal([]byte(*recv.Messages[0].Body), &got); err != nil {
-		t.Fatalf("unmarshaling received message: %v", err)
-	}
 	if got.EventVersion != 1 {
 		t.Fatalf("expected event_version 1, got %d", got.EventVersion)
 	}
-	if got.RequestID != event.RequestID || got.TenantID != event.TenantID || got.Alias != event.Alias {
+	if got.TenantID != event.TenantID || got.Alias != event.Alias {
 		t.Fatalf("received event does not match published event: %+v", got)
 	}
-
-	// Clean up so the queue doesn't accumulate test messages across runs.
-	client.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
-		QueueUrl:      &queueURL,
-		ReceiptHandle: recv.Messages[0].ReceiptHandle,
-	})
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Mouraovicente/ai-gateway/internal/core"
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
 	"github.com/Mouraovicente/ai-gateway/internal/router"
 )
@@ -52,6 +53,29 @@ func attemptPayload(a resilience.Attempt) map[string]any {
 		status = "error"
 	}
 	return map[string]any{"provider": a.Provider, "model": a.Model, "status": status}
+}
+
+// errorClassFromAttempts derives usage_event.error_class from the last
+// failed attempt's underlying error, instead of a hardcoded literal: a
+// *core.BackendError carries the real Transient/Permanent classification
+// (via errors.As, so a wrapped error still unwraps correctly); anything
+// else (a plain error, or no failed attempt at all) is reported as
+// "unknown" rather than guessed at.
+func errorClassFromAttempts(attempts []resilience.Attempt) string {
+	for i := len(attempts) - 1; i >= 0; i-- {
+		if attempts[i].Err == nil {
+			continue
+		}
+		var be *core.BackendError
+		if errors.As(attempts[i].Err, &be) {
+			if be.Class == core.Transient {
+				return "transient"
+			}
+			return "permanent"
+		}
+		return "unknown"
+	}
+	return "unknown"
 }
 
 // writeRouterError maps a router.Resolve error to its HTTP status/type per

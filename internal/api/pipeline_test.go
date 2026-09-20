@@ -10,13 +10,65 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mouraovicente/ai-gateway/internal/budget"
 	"github.com/Mouraovicente/ai-gateway/internal/config"
 	"github.com/Mouraovicente/ai-gateway/internal/core"
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
+	"github.com/Mouraovicente/ai-gateway/internal/stats"
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/usage"
 )
+
+// fakeUsagePublisher records every published usage.Event, so tests can
+// assert the exact status/error_class/attempts a given exit path produces.
+// blockUntilCtxDone, when set, makes Publish hang until ctx is cancelled
+// (used to exercise the pipeline's own publish timeout) instead of
+// returning immediately.
+type fakeUsagePublisher struct {
+	blockUntilCtxDone bool
+
+	mu     sync.Mutex
+	events []usage.Event
+}
+
+func (f *fakeUsagePublisher) Publish(ctx context.Context, event usage.Event) error {
+	if f.blockUntilCtxDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, event)
+	return nil
+}
+
+func (f *fakeUsagePublisher) published() []usage.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]usage.Event, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+// fakeErrBackend always fails Chat/ChatStream with a fixed error, used to
+// drive resilience.Call/CallStream into all_backends_failed with a known
+// error class on the resulting Attempt.
+type fakeErrBackend struct{ err error }
+
+func (f *fakeErrBackend) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
+	return core.ChatResponse{}, f.err
+}
+
+func (f *fakeErrBackend) ChatStream(ctx context.Context, model string, req core.ChatRequest) (<-chan core.ChatChunk, <-chan error) {
+	chunks := make(chan core.ChatChunk)
+	errs := make(chan error, 1)
+	close(chunks)
+	errs <- f.err
+	close(errs)
+	return chunks, errs
+}
 
 type fakeAuth struct{ tenant core.Tenant }
 
@@ -463,5 +515,193 @@ func TestPipeline_Streaming_ClientCancel_SettlesOnceQuietly(t *testing.T) {
 	}
 	if calls := fb.settleCalls(); len(calls) != 1 {
 		t.Fatalf("expected exactly one settle call on client cancel, got %+v", calls)
+	}
+}
+
+// fakeStatsRecorder records every Record call, so tests can assert a given
+// exit path does (or does not) feed the stats window.
+type fakeStatsRecorder struct {
+	mu      sync.Mutex
+	records int
+}
+
+func (f *fakeStatsRecorder) Record(route, model, tenantID string, latencyMs, tokens int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records++
+}
+
+func (f *fakeStatsRecorder) Snapshot() stats.Report { return stats.Report{} }
+
+func (f *fakeStatsRecorder) recordCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.records
+}
+
+func TestPipeline_ClientCancel_PublishesClientClosedAndSkipsStats(t *testing.T) {
+	fb := &fakeBudget{}
+	fu := &fakeUsagePublisher{}
+	fs := &fakeStatsRecorder{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    fb,
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeErrBackend{err: context.Canceled}},
+		Trace:     &fakeTrace{},
+		Usage:     fu,
+		Stats:     fs,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	events := fu.published()
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one published usage_event, got %d", len(events))
+	}
+	if events[0].Status != "client_closed" || events[0].ErrorClass != "" {
+		t.Fatalf("expected status=client_closed, error_class=\"\", got %+v", events[0])
+	}
+	if fs.recordCount() != 0 {
+		t.Fatalf("expected zero Stats.Record calls on a client cancel, got %d", fs.recordCount())
+	}
+}
+
+func TestPipeline_StreamingClientCancel_PublishesClientClosedAndSkipsStats(t *testing.T) {
+	backend := &fakeStreamBackend{streamChunks: []core.ChatChunk{{Delta: "hi"}}}
+	fb := &fakeBudget{}
+	fu := &fakeUsagePublisher{}
+	fs := &fakeStatsRecorder{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    fb,
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": backend},
+		Trace:     &fakeTrace{},
+		Usage:     fu,
+		Stats:     fs,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate a client that is already gone by the time onChunk runs
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","stream":true,"messages":[{"role":"user","content":"oi"}]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	events := fu.published()
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one published usage_event, got %d", len(events))
+	}
+	if events[0].Status != "client_closed" || events[0].ErrorClass != "" {
+		t.Fatalf("expected status=client_closed, error_class=\"\", got %+v", events[0])
+	}
+	if fs.recordCount() != 0 {
+		t.Fatalf("expected zero Stats.Record calls on a streaming client cancel, got %d", fs.recordCount())
+	}
+}
+
+func TestPipeline_AllBackendsFailed_ErrorClassReflectsTransientBackendError(t *testing.T) {
+	fu := &fakeUsagePublisher{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeErrBackend{err: &core.BackendError{Class: core.Transient, Status: 503, Err: errors.New("unavailable")}}},
+		Trace:     &fakeTrace{},
+		Usage:     fu,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}]}`))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	events := fu.published()
+	if len(events) != 1 || events[0].Status != "error" || events[0].ErrorClass != "transient" {
+		t.Fatalf("expected status=error, error_class=transient, got %+v", events)
+	}
+}
+
+func TestPipeline_AllBackendsFailed_ErrorClassReflectsPermanentBackendError(t *testing.T) {
+	fu := &fakeUsagePublisher{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeErrBackend{err: &core.BackendError{Class: core.Permanent, Status: 400, Err: errors.New("bad request")}}},
+		Trace:     &fakeTrace{},
+		Usage:     fu,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}]}`))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	events := fu.published()
+	if len(events) != 1 || events[0].Status != "error" || events[0].ErrorClass != "permanent" {
+		t.Fatalf("expected status=error, error_class=permanent, got %+v", events)
+	}
+}
+
+func TestPipeline_UsagePublishTimeout_EmitsFailedTraceEvent(t *testing.T) {
+	tr := &recordingTrace{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeChatBackend{content: "ok"}},
+		Trace:     tr,
+		Usage:     &fakeUsagePublisher{blockUntilCtxDone: true},
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}]}`))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+
+	before := time.Now()
+	handler.ServeHTTP(rec, req)
+	elapsed := time.Since(before)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The publish is bounded to 3s: the handler must still return (this call
+	// must not hang forever), even though the fake publisher never responds
+	// on its own.
+	if elapsed > 5*time.Second {
+		t.Fatalf("handler took too long (%s): usage publish is not properly bounded", elapsed)
+	}
+
+	found := false
+	for _, ev := range tr.types() {
+		if ev == trace.UsagePublish {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a usage_publish trace event even on timeout, got %v", tr.types())
 	}
 }

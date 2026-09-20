@@ -73,6 +73,11 @@ func main() {
 	// its key. Ollama needs no key, only a reachable base URL.
 	backends := map[string]resilience.FullBackend{}
 	registered := make([]string, 0, len(routing.Providers))
+	// hasPaidProvider is /readyz's explicit signal that a non-Ollama backend
+	// is configured (a key is present), replacing the earlier
+	// len(registered) > 1 heuristic, which broke as soon as Ollama itself
+	// was ever left unregistered.
+	hasPaidProvider := false
 
 	var ollamaClient *ollama.Client
 	if p, ok := routing.Providers["ollama"]; ok {
@@ -87,12 +92,14 @@ func main() {
 		if key := os.Getenv(p.APIKeyEnv); key != "" {
 			backends["openrouter"] = openrouter.NewClient(p.BaseURL, key)
 			registered = append(registered, "openrouter")
+			hasPaidProvider = true
 		}
 	}
 	if p, ok := routing.Providers["gemini"]; ok && p.APIKeyEnv != "" {
 		if key := os.Getenv(p.APIKeyEnv); key != "" {
 			backends["gemini"] = gemini.NewClient(p.BaseURL, key)
 			registered = append(registered, "gemini")
+			hasPaidProvider = true
 		}
 	}
 	logger.Info("registered backend providers", "providers", registered)
@@ -131,7 +138,9 @@ func main() {
 
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if _, err := dynamoClient.DescribeTable(r.Context(), &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if _, err := dynamoClient.DescribeTable(checkCtx, &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte(`{"status":"store unavailable"}`))
 			return
@@ -139,9 +148,9 @@ func main() {
 		// At least one backend must be reachable: Ollama is checked live via
 		// Tags; a paid provider counts as ready simply by having a
 		// configured API key (never call a paid backend just to warm up).
-		backendReady := len(registered) > 1 // openrouter/gemini registered means a key is configured
+		backendReady := hasPaidProvider
 		if ollamaClient != nil {
-			if _, err := ollamaClient.Tags(r.Context()); err == nil {
+			if _, err := ollamaClient.Tags(checkCtx); err == nil {
 				backendReady = true
 			}
 		}
@@ -154,20 +163,18 @@ func main() {
 		w.Write([]byte(`{"status":"ready"}`))
 	})
 
+	aliases := make([]string, 0, len(routing.Aliases))
+	for alias := range routing.Aliases {
+		aliases = append(aliases, alias)
+	}
+
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
-		var names []string
+		var tags []string
 		if ollamaClient != nil {
-			names, _ = ollamaClient.Tags(r.Context())
-		}
-		data := make([]map[string]string, 0, len(names)+len(routing.Aliases))
-		for alias := range routing.Aliases {
-			data = append(data, map[string]string{"id": alias})
-		}
-		for _, name := range names {
-			data = append(data, map[string]string{"id": "ollama/" + name})
+			tags, _ = ollamaClient.Tags(r.Context())
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": api.BuildModelsList(aliases, tags)})
 	})
 
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {

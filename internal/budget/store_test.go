@@ -4,16 +4,26 @@ package budget
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
 	"github.com/Mouraovicente/ai-gateway/internal/core"
 )
+
+// uniqueTenantID returns a tenant id unique to this test run, so repeated
+// runs against a reused LocalStack instance never see a budgets/reservations
+// row left over from a previous run (tenant ids used to be fixed literals,
+// which made these tests pass only once per fresh LocalStack).
+func uniqueTenantID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
 
 func newTestDynamoClient(t *testing.T) *dynamodb.Client {
 	t.Helper()
@@ -32,7 +42,7 @@ func TestReserveThenSettle_AdjustsUsedByDelta(t *testing.T) {
 	client := newTestDynamoClient(t)
 	store := NewDynamoStore(client, "budgets", "reservations")
 	ctx := context.Background()
-	tenantID := "tenant-budget-test-1"
+	tenantID := uniqueTenantID("tenant-budget-test-1")
 
 	reservation, err := store.Reserve(ctx, tenantID, "2026-09", 1000, 100000)
 	if err != nil {
@@ -51,7 +61,7 @@ func TestReserve_RejectsWhenOverBudget(t *testing.T) {
 	client := newTestDynamoClient(t)
 	store := NewDynamoStore(client, "budgets", "reservations")
 	ctx := context.Background()
-	tenantID := "tenant-budget-test-2"
+	tenantID := uniqueTenantID("tenant-budget-test-2")
 
 	if _, err := store.Reserve(ctx, tenantID, "2026-09", 900, 1000); err != nil {
 		t.Fatalf("first Reserve should succeed: %v", err)
@@ -65,7 +75,7 @@ func TestReserve_ConcurrentRequestsNeverExceedLimit(t *testing.T) {
 	client := newTestDynamoClient(t)
 	store := NewDynamoStore(client, "budgets", "reservations")
 	ctx := context.Background()
-	tenantID := "tenant-budget-race"
+	tenantID := uniqueTenantID("tenant-budget-race")
 	const limit = 1000
 	const perRequest = 30
 	const goroutines = 50 // 50 * 30 = 1500 > limit: some must be rejected

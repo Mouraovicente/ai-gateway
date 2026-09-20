@@ -91,6 +91,10 @@ func (r *inMemoryRecorder) Snapshot() Report {
 	return report
 }
 
+// percentile uses the nearest-rank method (index = p*n/100 into the sorted
+// slice), not linear interpolation between the two closest ranks: simpler,
+// and the value returned is always an actual observed sample, never an
+// average of two samples.
 func percentile(sorted []int, p int) int {
 	if len(sorted) == 0 {
 		return 0

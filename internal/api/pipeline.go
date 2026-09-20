@@ -181,7 +181,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 					Attempts:         attemptRecords,
 					TS:               time.Now().UTC().Format(time.RFC3339),
 				}
-				if err := p.Usage.Publish(traceCtx, event); err != nil {
+				// Bounded so a slow/stuck SQS call can never hold the request
+				// (or its deferred cleanup) open indefinitely; publish
+				// failures — including this timeout — are logged and traced,
+				// never surfaced to the caller.
+				publishCtx, cancelPublish := context.WithTimeout(traceCtx, 3*time.Second)
+				err := p.Usage.Publish(publishCtx, event)
+				cancelPublish()
+				if err != nil {
 					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
 					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "failed"})
 				} else {
@@ -217,12 +224,17 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			if isClientCancelled(ctx, err) {
 				// Client already disconnected: stop quietly, no body. The
 				// deferred budget.Settle above still runs with realTokens=0,
-				// releasing the estimate.
+				// releasing the estimate. The usage_event still fires (so the
+				// billing/consumption pipeline sees every request), but as
+				// status "client_closed" with no error_class, and it must
+				// never feed Stats (a disconnect isn't a real latency sample).
+				status = "client_closed"
+				errorClass = ""
 				return
 			}
 			emit(trace.Error, "resilience", map[string]any{"reason": "all_backends_failed"})
 			status = "error"
-			errorClass = "transient"
+			errorClass = errorClassFromAttempts(attempts)
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
 		}
@@ -326,17 +338,25 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 
 	if streamErr != nil && isClientCancelled(r.Context(), streamErr) {
 		emit(trace.Error, "resilience", map[string]any{"reason": "client_closed"})
+		// Same rule as the non-streaming cancel path: still publish a
+		// usage_event (status "client_closed", no error_class), but never
+		// feed Stats with a disconnect.
+		*outStatus = "client_closed"
+		*outErrorClass = ""
 		return
 	}
 
 	if streamErr != nil {
+		// reason is the trace_event's diagnostic label (which cascade stage
+		// failed); errorClass is the usage_event's classification of *why*
+		// (derived from the last attempt's actual error, never a guess tied
+		// to the reason string).
 		reason := "all_backends_failed"
-		*outStatus = "error"
-		*outErrorClass = "transient"
 		if errors.Is(streamErr, resilience.ErrStreamFailedAfterFirstByte) {
 			reason = "stream_failed_after_first_byte"
-			*outErrorClass = "stream_failed_after_first_byte"
 		}
+		*outStatus = "error"
+		*outErrorClass = errorClassFromAttempts(attempts)
 		emit(trace.Error, "resilience", map[string]any{"reason": reason})
 		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": scrubErrorText(streamErr), "request_id": requestID}})
 		fmt.Fprintf(w, "data: %s\n\n", payload)
