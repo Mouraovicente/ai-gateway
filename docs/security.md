@@ -66,6 +66,13 @@ Deliberate, not oversights:
   does expose internal topology to an authenticated caller, and would move
   to "detailed in the trace, summarized in the response" if the gateway ever
   served untrusted third parties.
+- **The pre-auth IP limiter's bucket is shared by every client behind the
+  same IP.** Only auth failures count, so well-behaved tenants don't burn the
+  budget themselves, but a NAT gateway or corporate egress puts many clients
+  behind one IP — a brute-forcer among them exhausts the shared 60/min bucket
+  and 429s the rest until it refills. Tune with
+  `IP_AUTH_FAILURES_PER_MINUTE` if a deployment's client population makes 60
+  too tight.
 - **One transitive advisory stays open**: GO-2026-6443 in
   `google.golang.org/grpc`, which arrives via the OTel exporter. It is not
   reachable (the gateway exports OTLP over HTTP and runs no gRPC server) and

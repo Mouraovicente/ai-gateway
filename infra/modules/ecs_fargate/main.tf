@@ -123,8 +123,12 @@ resource "aws_ecs_task_definition" "this" {
       portMappings = [
         { containerPort = var.container_port, protocol = "tcp" }
       ]
+      # TRUST_PROXY=true: this module always fronts the task with the ALB it
+      # creates, which sets X-Forwarded-For on every request. Without it the
+      # pre-auth IP limiter sees the ALB's own IP for all callers and one
+      # bucket of 60 auth failures 429s every tenant. See docs/deploy-fargate.md.
       environment = [
-        for k, v in var.environment : { name = k, value = v }
+        for k, v in merge({ TRUST_PROXY = "true" }, var.environment) : { name = k, value = v }
       ]
       # Provider API keys and other secrets are injected via valueFrom
       # references (Secrets Manager ARN or SSM parameter ARN), never as

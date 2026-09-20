@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -37,7 +38,18 @@ func (s *dynamoStore) RecordEvents(ctx context.Context, events []EventRecord) er
 	for _, e := range events {
 		item, err := s.eventItem(e.RequestID, e.Seq, e.Type, e.Node, e.Payload)
 		if err != nil {
-			// One bad event must not sink the batch: skip it, keep the rest.
+			// One bad event must not sink the batch: skip it, keep the rest,
+			// but log it — this is the only signal that a forbidden key made
+			// it into a trace payload on the async path. Never log the value.
+			key := "unknown"
+			for k := range e.Payload {
+				if isForbidden(k) {
+					key = k
+					break
+				}
+			}
+			slog.Default().Warn("trace: dropping event with forbidden payload key",
+				"request_id", e.RequestID, "seq", e.Seq, "type", e.Type, "key", key)
 			continue
 		}
 		requests = append(requests, types.WriteRequest{PutRequest: &types.PutRequest{Item: item}})

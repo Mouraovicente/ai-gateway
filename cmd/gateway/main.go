@@ -349,6 +349,15 @@ func main() {
 		}
 		tenant, err := authStore.ResolveAPIKey(r.Context(), apiKey)
 		if err != nil {
+			// Same three-way split as the chat pipeline: a bad tenant record
+			// is a config error (500), a store outage is retryable (503),
+			// and only an unknown key is the caller's fault (401).
+			if errors.Is(err, auth.ErrInvalidTenantConfig) {
+				logger.Error("auth: tenant record is unusable", "route", "/stats", "error", err.Error())
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":{"type":"tenant_misconfigured"}}`))
+				return
+			}
 			if !errors.Is(err, auth.ErrUnknownAPIKey) {
 				logger.Error("auth: tenant store unavailable", "route", "/stats", "error", err.Error())
 				w.Header().Set("Retry-After", "1")

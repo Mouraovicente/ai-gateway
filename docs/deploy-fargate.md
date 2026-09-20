@@ -33,6 +33,10 @@ docker tag ai-gateway:latest <account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gat
 docker push <account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest
 ```
 
+## TRUST_PROXY
+
+O módulo sempre coloca a task atrás do ALB que ele mesmo cria, e o ALB sempre define `X-Forwarded-For`. Por isso `infra/modules/ecs_fargate/main.tf` já injeta `TRUST_PROXY=true` no `environment` da task definition — sem isso, o limiter pré-auth vê o IP do próprio ALB para todo mundo e um único bucket de 60 falhas de auth/min derruba `/v1/chat/completions` e `/stats` para todos os tenants.
+
 ## Secrets (chaves dos provedores)
 
 As chaves dos provedores pagos (`OPENROUTER_API_KEY`, `GEMINI_API_KEY` — os nomes vêm de `api_key_env` em `config/routing.yaml`) nunca vão como `environment` plano na task definition. Crie-as no Secrets Manager e referencie por ARN:
