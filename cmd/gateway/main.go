@@ -219,13 +219,14 @@ func main() {
 			w.Write([]byte(`{"error":{"type":"missing_api_key"}}`))
 			return
 		}
-		if _, err := authStore.ResolveAPIKey(r.Context(), apiKey); err != nil {
+		tenant, err := authStore.ResolveAPIKey(r.Context(), apiKey)
+		if err != nil {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"error":{"type":"invalid_api_key"}}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(statsRecorder.Snapshot())
+		json.NewEncoder(w).Encode(statsRecorder.Snapshot(tenant.ID))
 	})
 
 	mux.Handle("POST /v1/chat/completions", api.NewPipelineChatHandler(pipeline))

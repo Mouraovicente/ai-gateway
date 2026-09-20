@@ -532,7 +532,7 @@ func (f *fakeStatsRecorder) Record(route, model, tenantID string, latencyMs, tok
 	f.records++
 }
 
-func (f *fakeStatsRecorder) Snapshot() stats.Report { return stats.Report{} }
+func (f *fakeStatsRecorder) Snapshot(tenantID string) stats.Report { return stats.Report{} }
 
 func (f *fakeStatsRecorder) recordCount() int {
 	f.mu.Lock()
