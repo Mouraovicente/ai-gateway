@@ -1,0 +1,89 @@
+# Deploy real em ECS Fargate (fora do LocalStack)
+
+Este documento cobre o `apply` real, feito manualmente contra uma conta AWS de verdade. O CI só roda `tflocal plan` contra LocalStack, com `enable_fargate = false` (ver `.github/workflows/ci.yml`, job `terraform-plan`) — LocalStack Community não emula ECS/ALB o suficiente para validar esses recursos, então o módulo `ecs_fargate` fica fora do plano do CI por padrão.
+
+## Pré-requisitos
+
+1. Conta AWS real com credenciais configuradas (`aws configure` ou variáveis `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).
+2. Uma VPC com ao menos duas subnets (idealmente públicas, para o ALB) e um security group liberando a porta 8080 de dentro da VPC e a 80 de fora — pode ser a VPC default da conta.
+3. Um repositório ECR para a imagem do gateway.
+
+## Build e push da imagem para o ECR
+
+```bash
+aws ecr create-repository --repository-name ai-gateway --region us-east-1   # uma vez só
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+
+docker build -t ai-gateway:latest .
+docker tag ai-gateway:latest <account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest
+docker push <account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest
+```
+
+## Secrets (chaves dos provedores)
+
+As chaves dos provedores pagos (`OPENROUTER_API_KEY`, `GEMINI_API_KEY` — os nomes vêm de `api_key_env` em `config/routing.yaml`) nunca vão como `environment` plano na task definition. Crie-as no Secrets Manager e referencie por ARN:
+
+```bash
+aws secretsmanager create-secret --name ai-gateway/openrouter-api-key --secret-string '<chave>'
+aws secretsmanager create-secret --name ai-gateway/gemini-api-key --secret-string '<chave>'
+```
+
+Depois, em `infra/main.tf`, preencha o mapa `secrets` do módulo `gateway_service` com `valueFrom` apontando pro ARN de cada secret:
+
+```hcl
+secrets = {
+  OPENROUTER_API_KEY = "arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/openrouter-api-key-XXXXXX"
+  GEMINI_API_KEY      = "arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/gemini-api-key-XXXXXX"
+}
+```
+
+A execution role do módulo já tem permissão `secretsmanager:GetSecretValue` restrita a esses ARNs (ver `infra/modules/ecs_fargate/main.tf`).
+
+## Apply
+
+1. O provider `aws` em `infra/main.tf` já é o mesmo usado pelo LocalStack (`endpoints` + `skip_*` + credenciais `test`). Para apply real, rode contra uma conta de verdade: `tflocal` sempre acrescenta os `endpoints` do LocalStack por cima da config, então para o apply real use `terraform` puro (não `tflocal`) com credenciais reais exportadas — o provider já resolve pro endpoint real da AWS quando não passado por `tflocal`.
+2. Passe as variáveis de rede e a imagem real:
+
+   ```bash
+   cd infra
+   terraform init
+   terraform plan \
+     -var enable_fargate=true \
+     -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
+     -var vpc_id=vpc-xxxxxxxx \
+     -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
+     -var 'security_group_ids=["sg-xxxxxxxx"]' \
+     -out=plan.tfplan
+   terraform apply plan.tfplan
+   ```
+
+3. Pegue o DNS do ALB no output `alb_dns_name` do módulo (`terraform output -module=gateway_service` ou o output do apply) e confirme o serviço de pé:
+
+   ```bash
+   curl -i http://<alb_dns_name>/readyz
+   # esperado: HTTP/1.1 200 OK, body {"status":"ready"}
+   ```
+
+   Pode levar 1-2 minutos até o health check do target group considerar a task healthy.
+
+## Custo
+
+Fargate (512 CPU / 1024 MB, 1 task, `us-east-1`) + ALB ficam ligados 24/7 na casa de **algumas dezenas de dólares por mês** (ALB tem custo fixo por hora + por LCU, mesmo com tráfego baixo; a task Fargate cobra por vCPU/memória-hora). Não é caro, mas também não é gratuito — não deixe rodando sem necessidade.
+
+## Destruir depois de testar
+
+Se o apply foi só um teste (ex.: validar a suíte de budget contra tabelas reais uma vez), destrua tudo em seguida:
+
+```bash
+terraform destroy \
+  -var enable_fargate=true \
+  -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
+  -var vpc_id=vpc-xxxxxxxx \
+  -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
+  -var 'security_group_ids=["sg-xxxxxxxx"]'
+```
+
+## Limitações conhecidas
+
+- LocalStack Community não simula ECS/ALB/IAM com fidelidade suficiente para validar esses recursos — por isso o CI só roda `tflocal plan` com `enable_fargate=false` (só DynamoDB + SQS) e uma validação estrutural (`terraform validate -var enable_fargate=true`), sem `plan`/`apply` contra LocalStack.
+- Este repo não provisiona VPC/subnets/security group — assume-se que já existem na conta (passe os IDs via `-var`).
