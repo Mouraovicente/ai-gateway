@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -16,6 +18,15 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
 )
+
+// attrValueString renders a span attribute value as text for the prompt-leak
+// check below, without using the deprecated Value.Emit.
+func attrValueString(v attribute.Value) string {
+	if v.Type() == attribute.STRING {
+		return v.AsString()
+	}
+	return fmt.Sprint(v.AsInterface())
+}
 
 // testPromptText is a marker string that must never leak into any span
 // attribute value: only metadata (ids, provider/model names, statuses) is
@@ -94,8 +105,9 @@ func TestPipeline_HappyPath_EmitsExpectedSpanHierarchy(t *testing.T) {
 					t.Errorf("span %q has forbidden attribute key %q", s.Name(), key)
 				}
 			}
-			if strings.Contains(attr.Value.Emit(), testPromptText) {
-				t.Errorf("span %q attribute %q leaks prompt text: %q", s.Name(), key, attr.Value.Emit())
+			valStr := attrValueString(attr.Value)
+			if strings.Contains(valStr, testPromptText) {
+				t.Errorf("span %q attribute %q leaks prompt text: %q", s.Name(), key, valStr)
 			}
 		}
 	}

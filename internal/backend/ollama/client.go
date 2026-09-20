@@ -166,7 +166,6 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64<<10), httpx.MaxStreamLineBytes)
-		sawDone := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
@@ -178,7 +177,6 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 				return
 			}
 			if parsed.Done {
-				sawDone = true
 				select {
 				case chunks <- core.ChatChunk{
 					FinishReason: parsed.DoneReason,
@@ -203,9 +201,9 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: reading stream: %w", err)}
 			return
 		}
-		if !sawDone {
-			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: stream truncated (no done:true)")}
-		}
+		// Reaching here means the loop ended (EOF) without hitting the
+		// parsed.Done branch above, which always returns.
+		errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: stream truncated (no done:true)")}
 	}()
 
 	return chunks, errs

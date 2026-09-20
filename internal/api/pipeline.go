@@ -421,7 +421,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			requestSpan.SetAttributes(otelattr.String("error.class", errorClass))
 			recordRequestMetrics(ctx, p.Metrics, requestMetricsArgs{
 				routing: p.Routing, alias: body.Model, resolvedModel: lastAttemptModel(attempts),
-				tenantID: tenant.ID, httpStatus: httpStatus, latencyMs: time.Since(start),
+				tenantID: tenant.ID, httpStatus: httpStatus, latency: time.Since(start),
 			})
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
@@ -436,7 +436,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		)
 		recordRequestMetrics(ctx, p.Metrics, requestMetricsArgs{
 			routing: p.Routing, alias: body.Model, resolvedModel: target.Model,
-			tenantID: tenant.ID, httpStatus: httpStatus, latencyMs: time.Since(start),
+			tenantID: tenant.ID, httpStatus: httpStatus, latency: time.Since(start),
 			promptTokens: resp.Usage.PromptTokens, completionTokens: resp.Usage.CompletionTokens,
 		})
 
@@ -505,9 +505,9 @@ type requestMetricsArgs struct {
 	routing                        *config.Routing
 	alias, resolvedModel, tenantID string
 	httpStatus                     int
-	latencyMs                      time.Duration
+	latency                        time.Duration
 	promptTokens, completionTokens int
-	ttftMs                         time.Duration
+	ttft                           time.Duration
 	recordTTFT                     bool
 }
 
@@ -529,7 +529,7 @@ func recordRequestMetrics(ctx context.Context, metrics *trace.Metrics, a request
 		otelattr.String("status", statusLabel),
 	)
 	metrics.RequestsTotal.Add(ctx, 1, baseAttrs)
-	metrics.LatencyMs.Record(ctx, float64(a.latencyMs.Milliseconds()), baseAttrs)
+	metrics.LatencyMs.Record(ctx, float64(a.latency.Milliseconds()), baseAttrs)
 	if a.promptTokens > 0 || a.completionTokens > 0 {
 		metrics.TokensTotal.Add(ctx, int64(a.promptTokens), metric.WithAttributes(
 			otelattr.String("route", route), otelattr.String("model", model), otelattr.String("tenant", a.tenantID), otelattr.String("kind", "prompt"),
@@ -539,7 +539,7 @@ func recordRequestMetrics(ctx context.Context, metrics *trace.Metrics, a request
 		))
 	}
 	if a.recordTTFT {
-		metrics.TTFTMs.Record(ctx, float64(a.ttftMs.Milliseconds()), baseAttrs)
+		metrics.TTFTMs.Record(ctx, float64(a.ttft.Milliseconds()), baseAttrs)
 	}
 }
 
@@ -727,9 +727,9 @@ func serveStreamPipeline(args streamArgs) {
 	}
 	recordRequestMetrics(args.ctx, args.p.Metrics, requestMetricsArgs{
 		routing: args.p.Routing, alias: args.alias, resolvedModel: resolvedModel,
-		tenantID: args.tenant.ID, httpStatus: *args.outHTTPStatus, latencyMs: time.Since(streamStart),
+		tenantID: args.tenant.ID, httpStatus: *args.outHTTPStatus, latency: time.Since(streamStart),
 		promptTokens: result.PromptTokens, completionTokens: result.CompletionTokens,
-		ttftMs: ttfb, recordTTFT: ttfbSet,
+		ttft: ttfb, recordTTFT: ttfbSet,
 	})
 
 	if streamErr != nil {

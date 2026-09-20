@@ -34,8 +34,12 @@ func TestHashAPIKey_IsDeterministicSHA256Hex(t *testing.T) {
 	if got != want {
 		t.Fatalf("HashAPIKey(%q) = %q, want %q", "abc", got, want)
 	}
-	if HashAPIKey("abc") != HashAPIKey("abc") {
+	again := HashAPIKey("abc")
+	if got != again {
 		t.Fatalf("HashAPIKey is not deterministic")
+	}
+	if HashAPIKey("abc") == HashAPIKey("abd") {
+		t.Fatalf("HashAPIKey collides on different input")
 	}
 }
 
