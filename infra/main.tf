@@ -54,3 +54,8 @@ module "reservations_table" {
   hash_key      = "reservation_id"
   ttl_attribute = "ttl"
 }
+
+module "usage_events_queue" {
+  source     = "./modules/sqs"
+  queue_name = "usage-events"
+}

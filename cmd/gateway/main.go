@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	"github.com/Mouraovicente/ai-gateway/internal/api"
 	"github.com/Mouraovicente/ai-gateway/internal/auth"
@@ -21,8 +24,13 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/config"
 	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
+	"github.com/Mouraovicente/ai-gateway/internal/stats"
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/usage"
 )
+
+// strPtr returns a pointer to s, for AWS SDK request fields that take *string.
+func strPtr(s string) *string { return &s }
 
 // getenv returns the environment variable named by key, or def if it is unset or empty.
 func getenv(key, def string) string {
@@ -66,10 +74,12 @@ func main() {
 	backends := map[string]resilience.FullBackend{}
 	registered := make([]string, 0, len(routing.Providers))
 
+	var ollamaClient *ollama.Client
 	if p, ok := routing.Providers["ollama"]; ok {
 		baseURL := getenv("OLLAMA_BASE_URL", p.BaseURL)
 		if baseURL != "" {
-			backends["ollama"] = ollama.NewClient(baseURL)
+			ollamaClient = ollama.NewClient(baseURL)
+			backends["ollama"] = ollamaClient
 			registered = append(registered, "ollama")
 		}
 	}
@@ -87,14 +97,30 @@ func main() {
 	}
 	logger.Info("registered backend providers", "providers", registered)
 
+	sqsClient := sqs.NewFromConfig(awsCfg)
+	usageQueueName := getenv("USAGE_QUEUE_NAME", "usage-events")
+	usageQueueOut, err := sqsClient.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: strPtr(usageQueueName)})
+	if err != nil {
+		logger.Error("resolving usage queue URL (did terraform apply run?)", "queue", usageQueueName, "error", err)
+		os.Exit(1)
+	}
+	usageQueueURL := *usageQueueOut.QueueUrl
+
+	authStore := auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants"))
+	statsRecorder := stats.NewInMemoryRecorder(5 * time.Minute)
+
 	pipeline := &api.Pipeline{
-		Auth:      auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants")),
+		Auth:      authStore,
 		RateLimit: ratelimit.NewInMemoryLimiter(),
 		Budget:    budget.NewDynamoStore(dynamoClient, getenv("BUDGETS_TABLE", "budgets"), getenv("RESERVATIONS_TABLE", "reservations")),
 		Routing:   routing,
 		Backends:  backends,
 		Trace:     trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events")),
+		Usage:     usage.NewSQSPublisher(sqsClient, usageQueueURL),
+		Stats:     statsRecorder,
 	}
+
+	tenantsTable := getenv("TENANTS_TABLE", "tenants")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +128,64 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := dynamoClient.DescribeTable(r.Context(), &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"store unavailable"}`))
+			return
+		}
+		// At least one backend must be reachable: Ollama is checked live via
+		// Tags; a paid provider counts as ready simply by having a
+		// configured API key (never call a paid backend just to warm up).
+		backendReady := len(registered) > 1 // openrouter/gemini registered means a key is configured
+		if ollamaClient != nil {
+			if _, err := ollamaClient.Tags(r.Context()); err == nil {
+				backendReady = true
+			}
+		}
+		if !backendReady {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"no backend reachable"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ready"}`))
+	})
+
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		var names []string
+		if ollamaClient != nil {
+			names, _ = ollamaClient.Tags(r.Context())
+		}
+		data := make([]map[string]string, 0, len(names)+len(routing.Aliases))
+		for alias := range routing.Aliases {
+			data = append(data, map[string]string{"id": alias})
+		}
+		for _, name := range names {
+			data = append(data, map[string]string{"id": "ollama/" + name})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+	})
+
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
+		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if apiKey == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"type":"missing_api_key"}}`))
+			return
+		}
+		if _, err := authStore.ResolveAPIKey(r.Context(), apiKey); err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"type":"invalid_api_key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(statsRecorder.Snapshot())
+	})
+
 	mux.Handle("POST /v1/chat/completions", api.NewPipelineChatHandler(pipeline))
 
 	handler := api.RequestIDMiddleware(mux)

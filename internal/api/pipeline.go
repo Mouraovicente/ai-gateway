@@ -18,16 +18,10 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
 	"github.com/Mouraovicente/ai-gateway/internal/router"
+	"github.com/Mouraovicente/ai-gateway/internal/stats"
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
+	"github.com/Mouraovicente/ai-gateway/internal/usage"
 )
-
-// UsagePublisher is Task 12's hook for publishing a usage event once a
-// request settles. Pipeline.Usage may be left nil (the default before Task
-// 12 wires a real implementation); NewPipelineChatHandler is nil-safe and
-// simply skips the usage_publish trace event in that case.
-type UsagePublisher interface {
-	Publish(ctx context.Context, requestID string, usage core.Usage) error
-}
 
 // Pipeline wires every module the real /v1/chat/completions handler needs.
 // This replaces the Task 5 NewChatHandler, which only called a fixed Ollama model.
@@ -38,7 +32,12 @@ type Pipeline struct {
 	Routing   *config.Routing
 	Backends  map[string]resilience.FullBackend
 	Trace     trace.Store
-	Usage     UsagePublisher
+	// Usage and Stats are Task 12's hooks, published/recorded once a request
+	// settles. Both may be left nil (the default in every pre-Task-12 test);
+	// NewPipelineChatHandler is nil-safe for each and simply skips the
+	// usage_publish trace event / stats recording in that case.
+	Usage usage.Publisher
+	Stats stats.Recorder
 }
 
 // NewPipelineChatHandler is the real handler for POST /v1/chat/completions:
@@ -49,6 +48,7 @@ type Pipeline struct {
 // fallback once the first byte has reached the client.
 func NewPipelineChatHandler(p *Pipeline) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		ctx := r.Context()
 		// traceCtx survives a client disconnect: trace events, the budget
 		// settle and the usage publish must still happen even when the
@@ -133,42 +133,83 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			slog.Error("trace: failed to record request", "request_id", requestID, "error", err.Error())
 		}
 
-		// usage is settled in this defer on every exit path (success, error,
-		// client cancel): zero value unless a call below reports real usage,
-		// which simply releases the pessimistic estimate made above. It is
-		// the single source of truth for both budget.Settle (which only
-		// wants the total) and the usage_publish event (which needs the
-		// prompt/completion split intact).
-		var usage core.Usage
+		// respUsage is settled in this defer on every exit path (success,
+		// error, client cancel): zero value unless a call below reports real
+		// usage, which simply releases the pessimistic estimate made above.
+		// It is the single source of truth for both budget.Settle (which
+		// only wants the total) and the usage_publish event (which needs the
+		// prompt/completion split intact). target/attempts/status/errorClass
+		// are filled in by whichever exit path runs (success, all backends
+		// failed, or router error), so the usage_event below always reflects
+		// what actually happened.
+		var respUsage core.Usage
+		var target core.BackendTarget
+		var attempts []resilience.Attempt
+		var ttftMs int
+		status := "ok"
+		errorClass := ""
 		defer func() {
-			realTokens := usage.PromptTokens + usage.CompletionTokens
+			realTokens := respUsage.PromptTokens + respUsage.CompletionTokens
 			if err := p.Budget.Settle(traceCtx, reservation, realTokens); err != nil {
 				slog.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
 			}
 			emit(trace.BudgetSettle, "budget", map[string]any{"tenant_id": tenant.ID, "real_tokens": realTokens})
+			latencyMs := int(time.Since(start).Milliseconds())
 			if p.Usage != nil {
-				if err := p.Usage.Publish(traceCtx, requestID, usage); err != nil {
-					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
-				} else {
-					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID})
+				attemptRecords := make([]usage.AttemptRecord, 0, len(attempts))
+				for _, a := range attempts {
+					attemptStatus := "ok"
+					if a.Err != nil {
+						attemptStatus = "error"
+					}
+					attemptRecords = append(attemptRecords, usage.AttemptRecord{Provider: a.Provider, Model: a.Model, Status: attemptStatus})
 				}
+				event := usage.Event{
+					EventVersion:     1,
+					RequestID:        requestID,
+					TenantID:         tenant.ID,
+					Tier:             tenant.Tier,
+					Alias:            body.Model,
+					Provider:         target.Provider,
+					Model:            target.Model,
+					PromptTokens:     respUsage.PromptTokens,
+					CompletionTokens: respUsage.CompletionTokens,
+					TTFTMs:           ttftMs,
+					LatencyMs:        latencyMs,
+					Status:           status,
+					ErrorClass:       errorClass,
+					Attempts:         attemptRecords,
+					TS:               time.Now().UTC().Format(time.RFC3339),
+				}
+				if err := p.Usage.Publish(traceCtx, event); err != nil {
+					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
+					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "failed"})
+				} else {
+					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "ok"})
+				}
+			}
+			if p.Stats != nil && status == "ok" {
+				p.Stats.Record(body.Model, target.Model, tenant.ID, latencyMs, realTokens)
 			}
 		}()
 
 		targets, err := router.Resolve(p.Routing, body.Model, tenant.Tier)
 		if err != nil {
 			emit(trace.Route, "router", map[string]any{"status": "error"})
+			status = "error"
+			errorClass = "permanent"
 			writeRouterError(w, requestID, err)
 			return
 		}
 		emit(trace.Route, "router", map[string]any{"targets": len(targets)})
 
 		if body.Stream {
-			serveStreamPipeline(w, r, p, targets, chatReq, requestID, &usage, emit)
+			serveStreamPipeline(w, r, p, targets, chatReq, requestID, &respUsage, &target, &attempts, &ttftMs, &status, &errorClass, emit)
 			return
 		}
 
-		resp, target, attempts, err := resilience.Call(ctx, toBackends(p.Backends), targets, chatReq)
+		var resp core.ChatResponse
+		resp, target, attempts, err = resilience.Call(ctx, toBackends(p.Backends), targets, chatReq)
 		for _, a := range attempts {
 			emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 		}
@@ -180,12 +221,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				return
 			}
 			emit(trace.Error, "resilience", map[string]any{"reason": "all_backends_failed"})
+			status = "error"
+			errorClass = "transient"
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
 		}
 		emit(trace.BackendResult, "resilience", map[string]any{"provider": target.Provider, "model": target.Model, "status": "ok", "prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens})
 
-		usage = resp.Usage
+		respUsage = resp.Usage
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -217,7 +260,7 @@ func isClientCancelled(ctx context.Context, err error) bool {
 // usage is filled in from the final reported core.Usage (prompt/completion
 // split intact) so the caller's deferred budget.Settle and usage_publish see
 // real, not estimated, numbers.
-func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, emit func(trace.EventType, string, map[string]any)) {
+func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, outTarget *core.BackendTarget, outAttempts *[]resilience.Attempt, outTTFTMs *int, outStatus *string, outErrorClass *string, emit func(trace.EventType, string, map[string]any)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		WriteError(w, requestID, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support flushing")
@@ -263,6 +306,8 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 		emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 	}
 	*usage = result
+	*outAttempts = attempts
+	*outTTFTMs = int(ttfb.Milliseconds())
 
 	if streamErr == nil {
 		var succeeded resilience.Attempt
@@ -271,6 +316,7 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 				succeeded = a
 			}
 		}
+		*outTarget = core.BackendTarget{Provider: succeeded.Provider, Model: succeeded.Model}
 		emit(trace.BackendResult, "resilience", map[string]any{
 			"provider": succeeded.Provider, "model": succeeded.Model, "status": "ok",
 			"latency_ms": time.Since(start).Milliseconds(), "ttft_ms": ttfb.Milliseconds(),
@@ -285,8 +331,11 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 
 	if streamErr != nil {
 		reason := "all_backends_failed"
+		*outStatus = "error"
+		*outErrorClass = "transient"
 		if errors.Is(streamErr, resilience.ErrStreamFailedAfterFirstByte) {
 			reason = "stream_failed_after_first_byte"
+			*outErrorClass = "stream_failed_after_first_byte"
 		}
 		emit(trace.Error, "resilience", map[string]any{"reason": reason})
 		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": scrubErrorText(streamErr), "request_id": requestID}})
