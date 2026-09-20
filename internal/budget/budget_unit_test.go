@@ -87,6 +87,57 @@ func TestSettle_DeltaIsRealMinusEstimated(t *testing.T) {
 	}
 }
 
+func TestReserve_NewTenantOverLimitIsRejected(t *testing.T) {
+	// Regression for the missing-row condition bug: attribute_not_exists(used)
+	// alone always passes, letting a brand-new tenant blow past the limit on
+	// their very first request. DynamoDB enforces the condition server-side,
+	// so simulate that here by returning ConditionalCheckFailedException,
+	// which is what a correct condition expression produces for this case.
+	fake := &fakeBudgetAPI{updateErr: &types.ConditionalCheckFailedException{}}
+	store := &dynamoStore{client: fake, budgetsTable: "budgets", reservationsTable: "reservations"}
+
+	_, err := store.Reserve(context.Background(), "new-tenant", "2026-09", 2000, 1000)
+	if !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("expected ErrBudgetExceeded for new tenant over limit, got %v", err)
+	}
+	if len(fake.updateInputs) != 1 {
+		t.Fatalf("expected exactly one UpdateItem call, got %d", len(fake.updateInputs))
+	}
+	cond := *fake.updateInputs[0].ConditionExpression
+	if !strings.Contains(cond, ":est <= :limit") {
+		t.Fatalf("expected condition to bound the missing-row case by :limit, got: %s", cond)
+	}
+	if _, ok := fake.updateInputs[0].ExpressionAttributeValues[":limit"]; !ok {
+		t.Fatalf("expected :limit expression attribute value to be set")
+	}
+}
+
+func TestReserve_CompensatesBudgetWhenPutItemFails(t *testing.T) {
+	fake := &fakeBudgetAPI{putErr: errors.New("dynamo unavailable")}
+	store := &dynamoStore{client: fake, budgetsTable: "budgets", reservationsTable: "reservations"}
+
+	_, err := store.Reserve(context.Background(), "tenant-1", "2026-09", 500, 1000)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "recording reservation") {
+		t.Fatalf("expected wrapped PutItem error, got: %v", err)
+	}
+	if len(fake.updateInputs) != 2 {
+		t.Fatalf("expected reserve UpdateItem + compensating UpdateItem, got %d calls", len(fake.updateInputs))
+	}
+	negAttr, ok := fake.updateInputs[1].ExpressionAttributeValues[":negEst"].(*types.AttributeValueMemberN)
+	if !ok {
+		t.Fatalf("expected compensating call to use :negEst, got %#v", fake.updateInputs[1].ExpressionAttributeValues)
+	}
+	if negAttr.Value != "-500" {
+		t.Fatalf("expected compensating delta -500, got %s", negAttr.Value)
+	}
+	if fake.updateInputs[1].ConditionExpression != nil {
+		t.Fatalf("expected compensating UpdateItem to be unconditional, got condition %q", *fake.updateInputs[1].ConditionExpression)
+	}
+}
+
 func TestSettle_WrapsClientErrors(t *testing.T) {
 	fake := &fakeBudgetAPI{updateErr: errors.New("boom")}
 	store := &dynamoStore{client: fake, budgetsTable: "budgets", reservationsTable: "reservations"}

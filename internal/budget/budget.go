@@ -66,6 +66,7 @@ func (s *dynamoStore) Reserve(ctx context.Context, tenantID, period string, esti
 	// is precomputed in Go: used <= limit - est.
 	exprValues, err := attributevalue.MarshalMap(map[string]any{
 		":est":        estimatedTokens,
+		":limit":      monthlyLimit,
 		":maxAllowed": monthlyLimit - estimatedTokens,
 	})
 	if err != nil {
@@ -76,7 +77,7 @@ func (s *dynamoStore) Reserve(ctx context.Context, tenantID, period string, esti
 		TableName:                 &s.budgetsTable,
 		Key:                       key,
 		UpdateExpression:          strPtr("ADD used :est"),
-		ConditionExpression:       strPtr("attribute_not_exists(used) OR used <= :maxAllowed"),
+		ConditionExpression:       strPtr("(attribute_not_exists(used) AND :est <= :limit) OR used <= :maxAllowed"),
 		ExpressionAttributeValues: exprValues,
 	})
 	if err != nil {
@@ -100,6 +101,20 @@ func (s *dynamoStore) Reserve(ctx context.Context, tenantID, period string, esti
 		return core.Reservation{}, fmt.Errorf("budget: marshaling reservation item: %w", err)
 	}
 	if _, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.reservationsTable, Item: reservationItem}); err != nil {
+		// The budget UpdateItem above already committed. Best-effort
+		// compensate so a failed reservation record doesn't leave tokens
+		// stuck as "used" forever; failure to compensate is not fatal to
+		// the caller (it already gets the original error), just logged
+		// upstream via the returned error's wrapping.
+		negValues, mErr := attributevalue.MarshalMap(map[string]any{":negEst": -estimatedTokens})
+		if mErr == nil {
+			_, _ = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+				TableName:                 &s.budgetsTable,
+				Key:                       key,
+				UpdateExpression:          strPtr("ADD used :negEst"),
+				ExpressionAttributeValues: negValues,
+			})
+		}
 		return core.Reservation{}, fmt.Errorf("budget: recording reservation: %w", err)
 	}
 
