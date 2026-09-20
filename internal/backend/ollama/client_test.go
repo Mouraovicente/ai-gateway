@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -222,5 +223,76 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for ChatStream goroutine to finish after ctx cancellation")
+	}
+}
+
+func TestChatStream_TruncatedStreamIsTransientError(t *testing.T) {
+	// Stream ends (server closes the body) without ever sending done:true.
+	body := []byte(`{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":"Ol"},"done":false}
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	req := core.ChatRequest{Messages: []core.Message{{Role: "user", Content: "oi"}}}
+	chunks, errs := client.ChatStream(context.Background(), "qwen2.5-coder:1.5b", req)
+	for range chunks {
+	}
+	err := <-errs
+	if err == nil {
+		t.Fatal("expected an error for a stream missing its terminal done:true")
+	}
+	var be *core.BackendError
+	if !errorsAs(err, &be) {
+		t.Fatalf("expected *core.BackendError, got %T", err)
+	}
+	if be.Class != core.Transient {
+		t.Fatalf("expected Transient class for truncated stream, got %v", be.Class)
+	}
+}
+
+func TestChat_ForwardsRequestIDHeader(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Request-Id")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	req := core.ChatRequest{RequestID: "req-xyz", Messages: []core.Message{{Role: "user", Content: "oi"}}}
+	if _, err := client.Chat(context.Background(), "qwen2.5-coder:1.5b", req); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if gotHeader != "req-xyz" {
+		t.Fatalf("expected X-Request-Id %q forwarded, got %q", "req-xyz", gotHeader)
+	}
+}
+
+func TestChat_ForwardsMaxTokensAsNumPredict(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	req := core.ChatRequest{MaxTokens: 128, Messages: []core.Message{{Role: "user", Content: "oi"}}}
+	if _, err := client.Chat(context.Background(), "qwen2.5-coder:1.5b", req); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	opts, ok := gotBody["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected options object in request body, got %+v", gotBody)
+	}
+	if opts["num_predict"] != float64(128) {
+		t.Fatalf("expected num_predict 128, got %v", opts["num_predict"])
 	}
 }

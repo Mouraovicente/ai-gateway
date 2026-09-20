@@ -26,6 +26,18 @@ type chatRequestBody struct {
 	Model    string         `json:"model"`
 	Messages []core.Message `json:"messages"`
 	Stream   bool           `json:"stream"`
+	Options  *options       `json:"options,omitempty"`
+}
+
+type options struct {
+	NumPredict int `json:"num_predict"`
+}
+
+func requestOptions(req core.ChatRequest) *options {
+	if req.MaxTokens <= 0 {
+		return nil
+	}
+	return &options{NumPredict: req.MaxTokens}
 }
 
 type chatResponseBody struct {
@@ -51,7 +63,7 @@ func errMessage(raw []byte) string {
 
 // Chat performs a single non-streaming call to Ollama's /api/chat.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
-	body, err := json.Marshal(chatRequestBody{Model: model, Messages: req.Messages, Stream: false})
+	body, err := json.Marshal(chatRequestBody{Model: model, Messages: req.Messages, Stream: false, Options: requestOptions(req)})
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("ollama: marshaling request: %w", err)}
 	}
@@ -61,6 +73,9 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("ollama: building request: %w", err)}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if req.RequestID != "" {
+		httpReq.Header.Set("X-Request-Id", req.RequestID)
+	}
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -112,7 +127,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		defer close(chunks)
 		defer close(errs)
 
-		body, err := json.Marshal(chatRequestBody{Model: model, Messages: req.Messages, Stream: true})
+		body, err := json.Marshal(chatRequestBody{Model: model, Messages: req.Messages, Stream: true, Options: requestOptions(req)})
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("ollama: marshaling request: %w", err)}
 			return
@@ -124,6 +139,9 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			return
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		if req.RequestID != "" {
+			httpReq.Header.Set("X-Request-Id", req.RequestID)
+		}
 
 		resp, err := c.http.Do(httpReq)
 		if err != nil {
@@ -143,6 +161,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
+		sawDone := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
@@ -154,6 +173,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 				return
 			}
 			if parsed.Done {
+				sawDone = true
 				select {
 				case chunks <- core.ChatChunk{
 					FinishReason: parsed.DoneReason,
@@ -163,17 +183,23 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 					},
 				}:
 				case <-ctx.Done():
+					errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: %w", ctx.Err())}
 				}
 				return
 			}
 			select {
 			case chunks <- core.ChatChunk{Delta: parsed.Message.Content}:
 			case <-ctx.Done():
+				errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: %w", ctx.Err())}
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil {
 			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: reading stream: %w", err)}
+			return
+		}
+		if !sawDone {
+			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: stream truncated (no done:true)")}
 		}
 	}()
 

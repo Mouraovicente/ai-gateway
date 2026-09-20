@@ -34,8 +34,13 @@ type content struct {
 }
 
 type requestBody struct {
-	SystemInstruction *content  `json:"systemInstruction,omitempty"`
-	Contents          []content `json:"contents"`
+	SystemInstruction *content       `json:"systemInstruction,omitempty"`
+	Contents          []content      `json:"contents"`
+	GenerationConfig  *generationCfg `json:"generationConfig,omitempty"`
+}
+
+type generationCfg struct {
+	MaxOutputTokens int `json:"maxOutputTokens"`
 }
 
 type candidate struct {
@@ -61,7 +66,8 @@ type responseBody struct {
 // toRequestBody splits messages into Gemini's contents (user/model turns)
 // and systemInstruction (system messages don't belong in contents; Gemini
 // rejects role "system" there), concatenating multiple system messages.
-func toRequestBody(messages []core.Message) requestBody {
+func toRequestBody(req core.ChatRequest) requestBody {
+	messages := req.Messages
 	contents := make([]content, 0, len(messages))
 	var systemParts []string
 	for _, m := range messages {
@@ -78,6 +84,9 @@ func toRequestBody(messages []core.Message) requestBody {
 	body := requestBody{Contents: contents}
 	if len(systemParts) > 0 {
 		body.SystemInstruction = &content{Parts: []part{{Text: strings.Join(systemParts, "\n")}}}
+	}
+	if req.MaxTokens > 0 {
+		body.GenerationConfig = &generationCfg{MaxOutputTokens: req.MaxTokens}
 	}
 	return body
 }
@@ -101,7 +110,7 @@ func classify(status int) core.ErrorClass {
 
 // Chat performs a single non-streaming call to Gemini's generateContent.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
-	body, err := json.Marshal(toRequestBody(req.Messages))
+	body, err := json.Marshal(toRequestBody(req))
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 	}
@@ -112,6 +121,9 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-goog-api-key", c.apiKey)
+	if req.RequestID != "" {
+		httpReq.Header.Set("X-Request-Id", req.RequestID)
+	}
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -158,7 +170,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		defer close(chunks)
 		defer close(errs)
 
-		body, err := json.Marshal(toRequestBody(req.Messages))
+		body, err := json.Marshal(toRequestBody(req))
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 			return
@@ -171,6 +183,9 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-goog-api-key", c.apiKey)
+		if req.RequestID != "" {
+			httpReq.Header.Set("X-Request-Id", req.RequestID)
+		}
 
 		resp, err := c.http.Do(httpReq)
 		if err != nil {
@@ -186,6 +201,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
+		sawTerminal := false
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || !strings.HasPrefix(line, "data: ") {
@@ -210,11 +226,22 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			if parsed.UsageMetadata != nil {
 				usage = &core.Usage{PromptTokens: parsed.UsageMetadata.PromptTokenCount, CompletionTokens: parsed.UsageMetadata.CandidatesTokenCount}
 			}
+			if parsed.UsageMetadata != nil || cand.FinishReason != "" {
+				sawTerminal = true
+			}
 			select {
 			case chunks <- core.ChatChunk{Delta: text, FinishReason: cand.FinishReason, Usage: usage}:
 			case <-ctx.Done():
+				errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: %w", ctx.Err())}
 				return
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: reading stream: %w", err)}
+			return
+		}
+		if !sawTerminal {
+			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: stream truncated (no usageMetadata/finishReason)")}
 		}
 	}()
 

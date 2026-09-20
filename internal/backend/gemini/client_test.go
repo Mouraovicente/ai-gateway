@@ -3,6 +3,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -217,7 +218,7 @@ func TestToRequestBody_SystemMessageBecomesSystemInstruction(t *testing.T) {
 		{Role: "user", Content: "oi"},
 		{Role: "assistant", Content: "olá"},
 	}
-	body := toRequestBody(messages)
+	body := toRequestBody(core.ChatRequest{Messages: messages})
 
 	if body.SystemInstruction == nil {
 		t.Fatalf("expected systemInstruction to be set")
@@ -254,5 +255,62 @@ func TestClassify_MapsStatusToErrorClass(t *testing.T) {
 		if got := classify(tc.status); got != tc.want {
 			t.Errorf("classify(%d) = %s, want %s", tc.status, got, tc.want)
 		}
+	}
+}
+
+func TestChatStream_TruncatedStreamIsTransientError(t *testing.T) {
+	// A candidate delta with neither finishReason nor usageMetadata, then the
+	// server closes the connection: never a legitimate terminal event.
+	sse := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Oi\"}]}}]}\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "key")
+	req := core.ChatRequest{Messages: []core.Message{{Role: "user", Content: "oi"}}}
+	chunks, errs := client.ChatStream(context.Background(), "gemini-pro", req)
+	for range chunks {
+	}
+	err := <-errs
+	if err == nil {
+		t.Fatal("expected an error for a stream missing its terminal marker")
+	}
+	be, ok := err.(*core.BackendError)
+	if !ok {
+		t.Fatalf("expected *core.BackendError, got %T", err)
+	}
+	if be.Class != core.Transient {
+		t.Fatalf("expected Transient class for truncated stream, got %v", be.Class)
+	}
+}
+
+func TestChat_ForwardsRequestIDAndMaxTokens(t *testing.T) {
+	var gotHeader string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Request-Id")
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"oi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "key")
+	req := core.ChatRequest{RequestID: "req-xyz", MaxTokens: 64, Messages: []core.Message{{Role: "user", Content: "oi"}}}
+	if _, err := client.Chat(context.Background(), "gemini-pro", req); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if gotHeader != "req-xyz" {
+		t.Fatalf("expected X-Request-Id forwarded, got %q", gotHeader)
+	}
+	cfg, ok := gotBody["generationConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected generationConfig in request body, got %+v", gotBody)
+	}
+	if cfg["maxOutputTokens"] != float64(64) {
+		t.Fatalf("expected maxOutputTokens 64, got %v", cfg["maxOutputTokens"])
 	}
 }

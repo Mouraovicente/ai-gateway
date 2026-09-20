@@ -33,6 +33,7 @@ type requestBody struct {
 	Messages      []core.Message `json:"messages"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
 }
 
 type responseBody struct {
@@ -60,7 +61,7 @@ func classify(status int) core.ErrorClass {
 
 // Chat performs a single non-streaming call to OpenRouter.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
-	body, err := json.Marshal(requestBody{Model: model, Messages: req.Messages, Stream: false})
+	body, err := json.Marshal(requestBody{Model: model, Messages: req.Messages, Stream: false, MaxTokens: req.MaxTokens})
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("openrouter: marshaling request: %w", err)}
 	}
@@ -70,6 +71,9 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if req.RequestID != "" {
+		httpReq.Header.Set("X-Request-Id", req.RequestID)
+	}
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -114,7 +118,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		defer close(chunks)
 		defer close(errs)
 
-		body, err := json.Marshal(requestBody{Model: model, Messages: req.Messages, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}})
+		body, err := json.Marshal(requestBody{Model: model, Messages: req.Messages, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}, MaxTokens: req.MaxTokens})
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("openrouter: marshaling request: %w", err)}
 			return
@@ -126,6 +130,9 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		if req.RequestID != "" {
+			httpReq.Header.Set("X-Request-Id", req.RequestID)
+		}
 
 		resp, err := c.http.Do(httpReq)
 		if err != nil {
@@ -156,17 +163,28 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 				return
 			}
 			if parsed.Usage != nil {
-				chunks <- core.ChatChunk{Usage: &core.Usage{PromptTokens: parsed.Usage.PromptTokens, CompletionTokens: parsed.Usage.CompletionTokens}}
+				select {
+				case chunks <- core.ChatChunk{Usage: &core.Usage{PromptTokens: parsed.Usage.PromptTokens, CompletionTokens: parsed.Usage.CompletionTokens}}:
+				case <-ctx.Done():
+					errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("openrouter: %w", ctx.Err())}
+					return
+				}
 				continue
 			}
 			if len(parsed.Choices) > 0 {
 				select {
 				case chunks <- core.ChatChunk{Delta: parsed.Choices[0].Delta.Content, FinishReason: parsed.Choices[0].FinishReason}:
 				case <-ctx.Done():
+					errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("openrouter: %w", ctx.Err())}
 					return
 				}
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("openrouter: reading stream: %w", err)}
+			return
+		}
+		errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("openrouter: stream truncated (no [DONE] marker)")}
 	}()
 
 	return chunks, errs
