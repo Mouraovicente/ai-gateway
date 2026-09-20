@@ -28,10 +28,16 @@ aws secretsmanager create-secret --name ai-gateway/openrouter-api-key --secret-s
 aws secretsmanager create-secret --name ai-gateway/gemini-api-key --secret-string '<chave>'
 ```
 
-Depois, em `infra/main.tf`, preencha o mapa `secrets` do módulo `gateway_service` com `valueFrom` apontando pro ARN de cada secret:
+Depois, passe os ARNs pela variável raiz `provider_secret_arns` (chave = nome da env var, valor = ARN do secret) — nunca editando `main.tf` direto. Ou por `-var`:
+
+```bash
+-var 'provider_secret_arns={OPENROUTER_API_KEY="arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/openrouter-api-key-XXXXXX",GEMINI_API_KEY="arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/gemini-api-key-XXXXXX"}'
+```
+
+ou num `terraform.tfvars` local (já coberto por `*.tfvars` no `.gitignore` — não versione esse arquivo):
 
 ```hcl
-secrets = {
+provider_secret_arns = {
   OPENROUTER_API_KEY = "arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/openrouter-api-key-XXXXXX"
   GEMINI_API_KEY      = "arn:aws:secretsmanager:us-east-1:<account-id>:secret:ai-gateway/gemini-api-key-XXXXXX"
 }
@@ -41,8 +47,8 @@ A execution role do módulo já tem permissão `secretsmanager:GetSecretValue` r
 
 ## Apply
 
-1. O provider `aws` em `infra/main.tf` já é o mesmo usado pelo LocalStack (`endpoints` + `skip_*` + credenciais `test`). Para apply real, rode contra uma conta de verdade: `tflocal` sempre acrescenta os `endpoints` do LocalStack por cima da config, então para o apply real use `terraform` puro (não `tflocal`) com credenciais reais exportadas — o provider já resolve pro endpoint real da AWS quando não passado por `tflocal`.
-2. Passe as variáveis de rede e a imagem real:
+1. Use `terraform` puro (não `tflocal`) com credenciais reais exportadas: `tflocal` sempre sobrepõe os `endpoints` do LocalStack, `terraform` puro resolve pro endpoint real da AWS.
+2. Passe as variáveis de rede, o repositório ECR e a imagem real:
 
    ```bash
    cd infra
@@ -50,12 +56,15 @@ A execution role do módulo já tem permissão `secretsmanager:GetSecretValue` r
    terraform plan \
      -var enable_fargate=true \
      -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
+     -var ecr_repository_arn=arn:aws:ecr:us-east-1:<account-id>:repository/ai-gateway \
      -var vpc_id=vpc-xxxxxxxx \
      -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
      -var 'security_group_ids=["sg-xxxxxxxx"]' \
      -out=plan.tfplan
    terraform apply plan.tfplan
    ```
+
+   `ecr_repository_arn` é obrigatório junto com `enable_fargate=true`: scopa a permissão de pull de imagem da execution role a esse repositório específico, em vez de `Resource = "*"`.
 
 3. Pegue o DNS do ALB no output `alb_dns_name` do módulo (`terraform output -module=gateway_service` ou o output do apply) e confirme o serviço de pé:
 
@@ -78,6 +87,7 @@ Se o apply foi só um teste (ex.: validar a suíte de budget contra tabelas reai
 terraform destroy \
   -var enable_fargate=true \
   -var image=<account-id>.dkr.ecr.us-east-1.amazonaws.com/ai-gateway:latest \
+  -var ecr_repository_arn=arn:aws:ecr:us-east-1:<account-id>:repository/ai-gateway \
   -var vpc_id=vpc-xxxxxxxx \
   -var 'subnet_ids=["subnet-aaaa","subnet-bbbb"]' \
   -var 'security_group_ids=["sg-xxxxxxxx"]'

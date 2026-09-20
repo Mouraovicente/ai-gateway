@@ -40,16 +40,20 @@ resource "aws_iam_role_policy" "execution" {
         Resource = "${aws_cloudwatch_log_group.this.arn}:*"
       },
       {
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      }
+      ],
+      var.ecr_repository_arn == null ? [] : [{
         Effect = "Allow"
         Action = [
-          "ecr:GetAuthorizationToken",
           "ecr:BatchCheckLayerAvailability",
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
         ]
-        Resource = "*"
-      }
-      ],
+        Resource = var.ecr_repository_arn
+      }],
       length(var.secrets) == 0 ? [] : [{
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue", "ssm:GetParameters"]

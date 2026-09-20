@@ -54,6 +54,13 @@ variable "security_group_ids" {
   default = []
 }
 
+# Required when enable_fargate is true at the root: scopes the execution
+# role's image-pull permissions to this one repository instead of "*".
+variable "ecr_repository_arn" {
+  type    = string
+  default = null
+}
+
 # --- DynamoDB tables the task role is allowed to read/write ---
 
 variable "dynamodb_table_arns" {

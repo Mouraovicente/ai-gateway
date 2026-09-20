@@ -39,4 +39,4 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - run: docker compose up -d localstack
       - working-directory: infra
-        run: tflocal init && tflocal validate && tflocal plan
+        run: terraform fmt -check -recursive && tflocal init && tflocal validate && tflocal plan

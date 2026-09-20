@@ -88,14 +88,29 @@ variable "vpc_id" {
   default = null
 }
 
-module "gateway_service" {
-  count          = var.enable_fargate ? 1 : 0
-  source         = "./modules/ecs_fargate"
-  image          = var.image
-  container_port = 8080
-  vpc_id         = var.vpc_id
-  subnet_ids     = var.subnet_ids
+# Required (via -var or terraform.tfvars) when enable_fargate is true: the
+# ECR repository the task's execution role is allowed to pull the image from.
+variable "ecr_repository_arn" {
+  type    = string
+  default = null
+}
 
+# Provider API keys (env var name -> Secrets Manager/SSM ARN), keyed exactly
+# as `api_key_env` in config/routing.yaml (e.g. OPENROUTER_API_KEY,
+# GEMINI_API_KEY). See docs/deploy-fargate.md for how to create them.
+variable "provider_secret_arns" {
+  type    = map(string)
+  default = {}
+}
+
+module "gateway_service" {
+  count              = var.enable_fargate ? 1 : 0
+  source             = "./modules/ecs_fargate"
+  image              = var.image
+  container_port     = 8080
+  vpc_id             = var.vpc_id
+  subnet_ids         = var.subnet_ids
+  ecr_repository_arn = var.ecr_repository_arn
   security_group_ids = var.security_group_ids
 
   dynamodb_table_arns = [
@@ -119,8 +134,5 @@ module "gateway_service" {
     USAGE_QUEUE_NAME   = module.usage_events_queue.queue_name
   }
 
-  # Provider API keys (OPENROUTER_API_KEY, GEMINI_API_KEY, per
-  # config/routing.yaml `api_key_env`) are wired here as Secrets Manager /
-  # SSM references, never as plain values. See docs/deploy-fargate.md.
-  secrets = {}
+  secrets = var.provider_secret_arns
 }
