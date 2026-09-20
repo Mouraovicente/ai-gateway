@@ -93,12 +93,13 @@ resource "aws_iam_role_policy" "task" {
           "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
           "dynamodb:Query",
+          "dynamodb:DescribeTable",
         ]
         Resource = var.dynamodb_table_arns
       }],
       var.usage_queue_arn == null ? [] : [{
         Effect   = "Allow"
-        Action   = ["sqs:SendMessage"]
+        Action   = ["sqs:SendMessage", "sqs:GetQueueUrl"]
         Resource = var.usage_queue_arn
       }]
     )
@@ -175,6 +176,26 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
+  # Always redirect plaintext to HTTPS: acm_certificate_arn is required
+  # (see variables.tf), so there is never a case where this module serves
+  # the gateway over plain HTTP.
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.acm_certificate_arn
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.this.arn
@@ -199,7 +220,7 @@ resource "aws_ecs_service" "this" {
     container_port   = var.container_port
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.http, aws_lb_listener.https]
 }
 
 output "cluster_name" {

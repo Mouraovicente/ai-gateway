@@ -61,6 +61,20 @@ variable "ecr_repository_arn" {
   default = null
 }
 
+# Required when enable_fargate is true at the root: the ALB always
+# terminates TLS on 443 and redirects plain HTTP to it, so a certificate is
+# mandatory, not optional. See docs/deploy-fargate.md for the prerequisite
+# (an ACM certificate for the gateway's domain, validated beforehand).
+variable "acm_certificate_arn" {
+  type    = string
+  default = null
+
+  validation {
+    condition     = var.acm_certificate_arn != null
+    error_message = "acm_certificate_arn is required: the ALB listener terminates TLS on 443 and has no HTTP-only fallback."
+  }
+}
+
 # --- DynamoDB tables the task role is allowed to read/write ---
 
 variable "dynamodb_table_arns" {

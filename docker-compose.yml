@@ -6,12 +6,18 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - USAGE_QUEUE_NAME=usage-events
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - localstack
-      - otel-collector
+      localstack:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
 
   localstack:
     image: localstack/localstack:3
@@ -19,6 +25,12 @@ services:
       - "4566:4566"
     environment:
       - SERVICES=dynamodb,sqs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.108.0

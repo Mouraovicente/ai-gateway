@@ -95,6 +95,15 @@ variable "ecr_repository_arn" {
   default = null
 }
 
+# Required (via -var or terraform.tfvars) when enable_fargate is true: the
+# ACM certificate the ALB's HTTPS:443 listener terminates TLS with. See
+# docs/deploy-fargate.md for the prerequisite (request/validate the
+# certificate for the gateway's domain before applying).
+variable "acm_certificate_arn" {
+  type    = string
+  default = null
+}
+
 # Provider API keys (env var name -> Secrets Manager/SSM ARN), keyed exactly
 # as `api_key_env` in config/routing.yaml (e.g. OPENROUTER_API_KEY,
 # GEMINI_API_KEY). See docs/deploy-fargate.md for how to create them.
@@ -104,14 +113,15 @@ variable "provider_secret_arns" {
 }
 
 module "gateway_service" {
-  count              = var.enable_fargate ? 1 : 0
-  source             = "./modules/ecs_fargate"
-  image              = var.image
-  container_port     = 8080
-  vpc_id             = var.vpc_id
-  subnet_ids         = var.subnet_ids
-  ecr_repository_arn = var.ecr_repository_arn
-  security_group_ids = var.security_group_ids
+  count               = var.enable_fargate ? 1 : 0
+  source              = "./modules/ecs_fargate"
+  image               = var.image
+  container_port      = 8080
+  vpc_id              = var.vpc_id
+  subnet_ids          = var.subnet_ids
+  ecr_repository_arn  = var.ecr_repository_arn
+  acm_certificate_arn = var.acm_certificate_arn
+  security_group_ids  = var.security_group_ids
 
   dynamodb_table_arns = [
     module.tenants_table.table_arn,
