@@ -78,7 +78,14 @@ variable "subnet_ids" {
   default = []
 }
 
-variable "security_group_ids" {
+# Leave both empty to let the Fargate module create the ALB/task security
+# group pair itself (recommended). Supplying them means supplying both.
+variable "alb_security_group_ids" {
+  type    = list(string)
+  default = []
+}
+
+variable "task_security_group_ids" {
   type    = list(string)
   default = []
 }
@@ -113,15 +120,16 @@ variable "provider_secret_arns" {
 }
 
 module "gateway_service" {
-  count               = var.enable_fargate ? 1 : 0
-  source              = "./modules/ecs_fargate"
-  image               = var.image
-  container_port      = 8080
-  vpc_id              = var.vpc_id
-  subnet_ids          = var.subnet_ids
-  ecr_repository_arn  = var.ecr_repository_arn
-  acm_certificate_arn = var.acm_certificate_arn
-  security_group_ids  = var.security_group_ids
+  count                   = var.enable_fargate ? 1 : 0
+  source                  = "./modules/ecs_fargate"
+  image                   = var.image
+  container_port          = 8080
+  vpc_id                  = var.vpc_id
+  subnet_ids              = var.subnet_ids
+  ecr_repository_arn      = var.ecr_repository_arn
+  acm_certificate_arn     = var.acm_certificate_arn
+  alb_security_group_ids  = var.alb_security_group_ids
+  task_security_group_ids = var.task_security_group_ids
 
   dynamodb_table_arns = [
     module.tenants_table.table_arn,

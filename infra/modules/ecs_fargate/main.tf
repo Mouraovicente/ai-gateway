@@ -144,6 +144,72 @@ resource "aws_ecs_task_definition" "this" {
   ])
 }
 
+# --- Security groups: one for the ALB (public), one for the task (private) ---
+#
+# The task SG allows the container port from the ALB SG *only*, never from a
+# CIDR. That is what stops anyone from talking to the task directly (and
+# bypassing TLS and any future WAF) when the task ends up with a public IP.
+
+locals {
+  create_security_groups = length(var.alb_security_group_ids) == 0 && length(var.task_security_group_ids) == 0
+  alb_security_groups    = local.create_security_groups ? [aws_security_group.alb[0].id] : var.alb_security_group_ids
+  task_security_groups   = local.create_security_groups ? [aws_security_group.task[0].id] : var.task_security_group_ids
+}
+
+resource "aws_security_group" "alb" {
+  count       = local.create_security_groups ? 1 : 0
+  name        = "${var.service_name}-alb"
+  description = "Public ingress to the ai-gateway ALB (443, and 80 for the redirect)"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description = "HTTPS from the internet"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.alb_ingress_cidr_blocks
+  }
+
+  ingress {
+    description = "HTTP, redirected to HTTPS by the listener"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.alb_ingress_cidr_blocks
+  }
+
+  egress {
+    description = "To the task"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "task" {
+  count       = local.create_security_groups ? 1 : 0
+  name        = "${var.service_name}-task"
+  description = "ai-gateway task: container port from the ALB security group only"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description     = "Gateway port, from the ALB only"
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb[0].id]
+  }
+
+  egress {
+    description = "Outbound to AWS APIs and LLM providers"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 # --- ALB in front of the service, health-checked on /readyz ---
 
 resource "aws_lb" "this" {
@@ -151,7 +217,14 @@ resource "aws_lb" "this" {
   load_balancer_type = "application"
   internal           = false
   subnets            = var.subnet_ids
-  security_groups    = var.security_group_ids
+  security_groups    = local.alb_security_groups
+
+  lifecycle {
+    precondition {
+      condition     = local.create_security_groups || (length(var.alb_security_group_ids) > 0 && length(var.task_security_group_ids) > 0)
+      error_message = "Supply both alb_security_group_ids and task_security_group_ids, or neither (the module then creates the pair itself). One alone would leave the other on the VPC default security group."
+    }
+  }
 }
 
 resource "aws_lb_target_group" "this" {
@@ -211,7 +284,7 @@ resource "aws_ecs_service" "this" {
 
   network_configuration {
     subnets         = var.subnet_ids
-    security_groups = var.security_group_ids
+    security_groups = local.task_security_groups
   }
 
   load_balancer {

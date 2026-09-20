@@ -5,7 +5,7 @@ Este documento cobre o `apply` real, feito manualmente contra uma conta AWS de v
 ## Pré-requisitos
 
 1. Conta AWS real com credenciais configuradas (`aws configure` ou variáveis `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).
-2. Uma VPC com ao menos duas subnets (idealmente públicas, para o ALB) e um security group liberando a porta 8080 de dentro da VPC e a 443 de fora — pode ser a VPC default da conta.
+2. Uma VPC com ao menos duas subnets (idealmente públicas, para o ALB). **Não passe security group nenhum**: o módulo cria o par certo sozinho — um SG no ALB aceitando 443/80 da internet e um SG na task aceitando a porta 8080 **só do SG do ALB**, nunca de um CIDR. Isso é o que impede alguém de falar direto com a porta 8080 da task, contornando o TLS (e qualquer WAF futuro). Se você precisa mesmo usar SGs já existentes, passe `alb_security_group_ids` **e** `task_security_group_ids` (os dois, não vazios — o módulo recusa o apply com só um, porque o outro cairia no SG default da VPC).
 3. Um repositório ECR para a imagem do gateway.
 4. Um certificado ACM para o domínio do gateway, **na mesma região** do ALB (`us-east-1` nos exemplos abaixo — ACM é regional, um certificado emitido em outra região não aparece como opção pro listener HTTPS). Peça e valide por DNS antes do apply:
 
@@ -112,5 +112,5 @@ terraform destroy \
 ## Limitações conhecidas
 
 - LocalStack Community não simula ECS/ALB/IAM com fidelidade suficiente para validar esses recursos — por isso o CI só roda `tflocal plan` com `enable_fargate=false` (só DynamoDB + SQS) e uma validação estrutural (`terraform validate -var enable_fargate=true`), sem `plan`/`apply` contra LocalStack.
-- Este repo não provisiona VPC/subnets/security group — assume-se que já existem na conta (passe os IDs via `-var`).
+- Este repo não provisiona VPC/subnets — assume-se que já existem na conta (passe os IDs via `-var`). Os security groups, esses sim, o módulo cria (ALB e task separados); veja Pré-requisitos.
 - Este repo também não provisiona o certificado ACM nem os registros DNS de validação — peça e valide manualmente (seção Pré-requisitos) antes do apply.

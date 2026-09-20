@@ -2,8 +2,8 @@ package api
 
 import "testing"
 
-func TestBuildModelsList_EveryEntryIsAModelObject(t *testing.T) {
-	data := BuildModelsList([]string{"nuva/fast"}, []string{"qwen2.5-coder:1.5b"})
+func TestBuildModelsList_ListsAliasesOnly(t *testing.T) {
+	data := BuildModelsList([]string{"nuva/fast", "nuva/smart"})
 	if len(data) != 2 {
 		t.Fatalf("expected 2 entries, got %d: %+v", len(data), data)
 	}
@@ -15,10 +15,17 @@ func TestBuildModelsList_EveryEntryIsAModelObject(t *testing.T) {
 			t.Fatalf("expected owned_by=ai-gateway, got %+v", m)
 		}
 	}
-	if data[0].ID != "nuva/fast" {
-		t.Fatalf("expected alias id nuva/fast, got %+v", data[0])
+	if data[0].ID != "nuva/fast" || data[1].ID != "nuva/smart" {
+		t.Fatalf("unexpected ids: %+v", data)
 	}
-	if data[1].ID != "ollama/qwen2.5-coder:1.5b" {
-		t.Fatalf("expected ollama-prefixed id, got %+v", data[1])
+}
+
+// The endpoint is unauthenticated, so the backend inventory must not be in
+// the response at all — no provider-prefixed entries, ever.
+func TestBuildModelsList_DoesNotExposeBackendInventory(t *testing.T) {
+	for _, m := range BuildModelsList([]string{"nuva/fast"}) {
+		if m.ID != "nuva/fast" {
+			t.Fatalf("unexpected non-alias entry %q in /v1/models", m.ID)
+		}
 	}
 }

@@ -3,20 +3,28 @@ on:
   push:
   pull_request:
 
+# Least privilege for GITHUB_TOKEN: this workflow only ever reads the repo.
+# Without this block the token inherits the account default, which on older
+# accounts is write-all — and every job here runs on pull_request, i.e. on
+# code from any fork once the repo is public. No job uses `secrets.`, so a
+# fork PR gets no credentials either.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
           go-version: "1.27"
       - run: go vet ./...
       - run: go test -race ./...
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db8 # v6.1.1
         with:
-          version: latest
-      - uses: gitleaks/gitleaks-action@v2
+          version: v1.64.8
+      - uses: gitleaks/gitleaks-action@83373cf2f8c4db6e24b41c1a9b086bb9619e9cd3 # v2.3.7
 
   integration:
     runs-on: ubuntu-latest
@@ -27,8 +35,8 @@ jobs:
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://localhost:4566
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
           go-version: "1.27"
       - run: docker compose up -d localstack
@@ -43,7 +51,7 @@ jobs:
           done
           echo "LocalStack did not become healthy in time" >&2
           exit 1
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       - run: pip install terraform-local awscli-local
       - name: Apply infra against LocalStack
         working-directory: infra
@@ -58,9 +66,9 @@ jobs:
   terraform-plan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pip install terraform-local
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       - run: docker compose up -d localstack
       - working-directory: infra
         run: terraform fmt -check -recursive && tflocal init && tflocal validate && tflocal plan

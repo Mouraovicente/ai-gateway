@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"strconv"
 	"syscall"
 	"time"
@@ -34,6 +35,13 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
 	"github.com/Mouraovicente/ai-gateway/internal/usage"
 )
+
+// readyResult is one cached /readyz outcome (see checkReady).
+type readyResult struct {
+	at     time.Time
+	status int
+	body   string
+}
 
 // strPtr returns a pointer to s, for AWS SDK request fields that take *string.
 func strPtr(s string) *string { return &s }
@@ -257,34 +265,50 @@ func main() {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	// readiness is cached: /readyz is unauthenticated and does real I/O
+	// (DescribeTable has a low account-wide control-plane quota, and the
+	// Ollama call is an outbound request), so hammering it must not be able
+	// to throttle the account or DoS the very health check the ALB uses.
+	var readyCache atomic.Pointer[readyResult]
+	const readyTTL = 5 * time.Second
+	checkReady := func(ctx context.Context) readyResult {
+		if cached := readyCache.Load(); cached != nil && time.Since(cached.at) < readyTTL {
+			return *cached
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		// In memory mode there is no store to be unavailable.
-		if dynamoClient != nil {
-			if _, err := dynamoClient.DescribeTable(checkCtx, &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte(`{"status":"store unavailable"}`))
-				return
+		res := readyResult{at: time.Now(), status: http.StatusOK, body: `{"status":"ready"}`}
+		switch {
+		case dynamoClient != nil && func() bool {
+			_, err := dynamoClient.DescribeTable(checkCtx, &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)})
+			return err != nil
+		}():
+			// In memory mode there is no store that could be unavailable.
+			res.status, res.body = http.StatusServiceUnavailable, `{"status":"store unavailable"}`
+		default:
+			// At least one backend must be reachable: Ollama is checked
+			// live via Tags; a paid provider counts as ready simply by
+			// having a configured API key (never call a paid backend just
+			// to warm up).
+			backendReady := hasPaidProvider
+			if !backendReady && ollamaClient != nil {
+				if _, err := ollamaClient.Tags(checkCtx); err == nil {
+					backendReady = true
+				}
+			}
+			if !backendReady {
+				res.status, res.body = http.StatusServiceUnavailable, `{"status":"no backend reachable"}`
 			}
 		}
-		// At least one backend must be reachable: Ollama is checked live via
-		// Tags; a paid provider counts as ready simply by having a
-		// configured API key (never call a paid backend just to warm up).
-		backendReady := hasPaidProvider
-		if ollamaClient != nil {
-			if _, err := ollamaClient.Tags(checkCtx); err == nil {
-				backendReady = true
-			}
-		}
-		if !backendReady {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"no backend reachable"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready"}`))
+		readyCache.Store(&res)
+		return res
+	}
+
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		res := checkReady(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(res.status)
+		w.Write([]byte(res.body))
 	})
 
 	aliases := make([]string, 0, len(routing.Aliases))
@@ -292,13 +316,17 @@ func main() {
 		aliases = append(aliases, alias)
 	}
 
+	// Aliases only, and no backend call: this endpoint is unauthenticated,
+	// so it must neither leak the backend inventory nor give an anonymous
+	// caller a way to generate load on Ollama.
+	modelsBody, err := json.Marshal(map[string]any{"object": "list", "data": api.BuildModelsList(aliases)})
+	if err != nil {
+		logger.Error("building models list", "error", err)
+		os.Exit(1)
+	}
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
-		var tags []string
-		if ollamaClient != nil {
-			tags, _ = ollamaClient.Tags(r.Context())
-		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": api.BuildModelsList(aliases, tags)})
+		w.Write(modelsBody)
 	})
 
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {

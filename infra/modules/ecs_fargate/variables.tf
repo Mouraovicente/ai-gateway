@@ -49,9 +49,25 @@ variable "subnet_ids" {
   default = []
 }
 
-variable "security_group_ids" {
+# Security groups are split by role on purpose: the ALB takes 443/80 from
+# the internet, the task takes 8080 from the ALB's SG only. Leave both empty
+# (the default) and the module creates that pair itself — which is the only
+# configuration that cannot be got wrong. Supplying them means supplying
+# BOTH, non-empty; see the precondition on aws_lb.this.
+variable "alb_security_group_ids" {
   type    = list(string)
   default = []
+}
+
+variable "task_security_group_ids" {
+  type    = list(string)
+  default = []
+}
+
+# CIDRs allowed to reach the ALB on 443/80 when the module creates the SGs.
+variable "alb_ingress_cidr_blocks" {
+  type    = list(string)
+  default = ["0.0.0.0/0"]
 }
 
 # Required when enable_fargate is true at the root: scopes the execution

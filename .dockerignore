@@ -1,5 +1,12 @@
 .git
+.gitignore
+.github
 .superpowers
 infra
 docs
+bench
 *.md
+.env*
+*.tfstate*
+.terraform
+bin/
