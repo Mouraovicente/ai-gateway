@@ -262,7 +262,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	// readiness is cached: /readyz is unauthenticated and does real I/O
@@ -308,7 +308,7 @@ func main() {
 		res := checkReady(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(res.status)
-		w.Write([]byte(res.body))
+		_, _ = w.Write([]byte(res.body))
 	})
 
 	aliases := make([]string, 0, len(routing.Aliases))
@@ -326,7 +326,7 @@ func main() {
 	}
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(modelsBody)
+		_, _ = w.Write(modelsBody)
 	})
 
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
@@ -337,14 +337,14 @@ func main() {
 		if !ipLimiter.Allowed(clientIP) {
 			w.Header().Set("Retry-After", "60")
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":{"type":"rate_limited"}}`))
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limited"}}`))
 			return
 		}
 		apiKey, ok := api.ParseBearer(r.Header.Get("Authorization"))
 		if !ok {
 			ipLimiter.RecordFailure(clientIP)
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":{"type":"missing_api_key"}}`))
+			_, _ = w.Write([]byte(`{"error":{"type":"missing_api_key"}}`))
 			return
 		}
 		tenant, err := authStore.ResolveAPIKey(r.Context(), apiKey)
@@ -355,22 +355,22 @@ func main() {
 			if errors.Is(err, auth.ErrInvalidTenantConfig) {
 				logger.Error("auth: tenant record is unusable", "route", "/stats", "error", err.Error())
 				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":{"type":"tenant_misconfigured"}}`))
+				_, _ = w.Write([]byte(`{"error":{"type":"tenant_misconfigured"}}`))
 				return
 			}
 			if !errors.Is(err, auth.ErrUnknownAPIKey) {
 				logger.Error("auth: tenant store unavailable", "route", "/stats", "error", err.Error())
 				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte(`{"error":{"type":"store_unavailable"}}`))
+				_, _ = w.Write([]byte(`{"error":{"type":"store_unavailable"}}`))
 				return
 			}
 			ipLimiter.RecordFailure(clientIP)
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":{"type":"invalid_api_key"}}`))
+			_, _ = w.Write([]byte(`{"error":{"type":"invalid_api_key"}}`))
 			return
 		}
-		json.NewEncoder(w).Encode(statsRecorder.Snapshot(tenant.ID))
+		_ = json.NewEncoder(w).Encode(statsRecorder.Snapshot(tenant.ID))
 	})
 
 	mux.Handle("POST /v1/chat/completions", api.NewPipelineChatHandler(pipeline))

@@ -342,7 +342,7 @@ func TestPipeline_UnknownAlias_Returns400(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 	var body map[string]map[string]string
-	json.Unmarshal(rec.Body.Bytes(), &body)
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["error"]["type"] != "unknown_model" {
 		t.Fatalf("unexpected error type: %+v", body)
 	}

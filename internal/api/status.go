@@ -109,7 +109,7 @@ func writeAllBackendsFailed(w http.ResponseWriter, requestID string, attempts []
 	for _, a := range attempts {
 		attemptBodies = append(attemptBodies, map[string]any{"provider": a.Provider, "model": a.Model, "status": a.Status, "error": scrubErrorText(a.Err)})
 	}
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error":    map[string]any{"type": "all_backends_failed", "message": "every backend in the cascade failed", "request_id": requestID},
 		"attempts": attemptBodies,
 	})

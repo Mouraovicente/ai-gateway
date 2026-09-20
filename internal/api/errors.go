@@ -20,5 +20,5 @@ type errorDetail struct {
 func WriteError(w http.ResponseWriter, requestID string, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(errorBody{Error: errorDetail{Type: errType, Message: message, RequestID: requestID}})
+	_ = json.NewEncoder(w).Encode(errorBody{Error: errorDetail{Type: errType, Message: message, RequestID: requestID}})
 }

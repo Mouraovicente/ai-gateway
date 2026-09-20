@@ -19,7 +19,7 @@ func TestChatHandler_NonStreaming_ReturnsOpenAIShapedResponse(t *testing.T) {
 		t.Fatalf("reading fixture: %v", err)
 	}
 	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer ollamaSrv.Close()
 
@@ -59,7 +59,7 @@ func TestChatHandler_Streaming_EmitsSSEWithDoneSentinel(t *testing.T) {
 		t.Fatalf("reading fixture: %v", err)
 	}
 	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer ollamaSrv.Close()
 
@@ -132,7 +132,7 @@ func TestChatHandler_ClientCancelMidStream_ReturnsPromptly(t *testing.T) {
 	backendSawCancel := make(chan struct{}, 1)
 	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher := w.(http.Flusher)
-		w.Write([]byte(`{"message":{"role":"assistant","content":"hi"},"done":false}` + "\n"))
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"hi"},"done":false}` + "\n"))
 		flusher.Flush()
 		<-r.Context().Done()
 		backendSawCancel <- struct{}{}

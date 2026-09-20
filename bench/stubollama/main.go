@@ -40,7 +40,7 @@ func main() {
 
 	mux.HandleFunc("GET /api/tags", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{
 			{"name": "qwen2.5-coder:1.5b", "model": "qwen2.5-coder:1.5b"},
 		}})
 	})
@@ -57,7 +57,7 @@ func main() {
 
 		if !req.Stream {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(chatResponse{
+			_ = json.NewEncoder(w).Encode(chatResponse{
 				Message:         message{Role: "assistant", Content: "pong"},
 				Done:            true,
 				DoneReason:      "stop",
@@ -71,12 +71,12 @@ func main() {
 		flusher, _ := w.(http.Flusher)
 		enc := json.NewEncoder(w)
 		for i := 0; i < *tokens; i++ {
-			enc.Encode(chatResponse{Message: message{Role: "assistant", Content: "p"}})
+			_ = enc.Encode(chatResponse{Message: message{Role: "assistant", Content: "p"}})
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
-		enc.Encode(chatResponse{
+		_ = enc.Encode(chatResponse{
 			Message:         message{Role: "assistant", Content: ""},
 			Done:            true,
 			DoneReason:      "stop",

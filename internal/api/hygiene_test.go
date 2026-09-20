@@ -210,10 +210,10 @@ func TestPipeline_Streaming_SlowClientIsCutByWriteDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	body := `{"model":"nuva/fast","messages":[{"role":"user","content":"hi"}],"stream":true}`
-	fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer valid-key-abcdef\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	_, _ = fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer valid-key-abcdef\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
 
 	// Read nothing at all from here on: the socket buffer fills and every
 	// further write blocks past the deadline.

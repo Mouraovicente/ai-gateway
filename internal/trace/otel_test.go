@@ -9,7 +9,7 @@ import (
 
 func TestNewMetrics_RegistersAllFourInstruments(t *testing.T) {
 	provider := metric.NewMeterProvider()
-	defer provider.Shutdown(context.Background())
+	defer func() { _ = provider.Shutdown(context.Background()) }()
 	meter := provider.Meter("ai-gateway-test")
 
 	m, err := NewMetrics(meter)

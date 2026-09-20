@@ -24,7 +24,7 @@ func serveFixture(t *testing.T, status int, fixturePath string) *httptest.Server
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 }
 
@@ -88,7 +88,7 @@ func TestChat_ErrorBodyOn200_IsPermanentError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"model":"does-not-exist","done":true,"error":"model not found"}`))
+		_, _ = w.Write([]byte(`{"model":"does-not-exist","done":true,"error":"model not found"}`))
 	}))
 	defer srv.Close()
 
@@ -112,7 +112,7 @@ func TestChat_NotDone_IsTransientError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":"partial"},"done":false}`))
+		_, _ = w.Write([]byte(`{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":"partial"},"done":false}`))
 	}))
 	defer srv.Close()
 
@@ -140,7 +140,7 @@ func TestChatStream_EmitsDeltasThenFinalUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -192,7 +192,7 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -233,7 +233,7 @@ func TestChatStream_TruncatedStreamIsTransientError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -260,7 +260,7 @@ func TestChat_ForwardsRequestIDHeader(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("X-Request-Id")
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
 	}))
 	defer srv.Close()
 
@@ -277,9 +277,9 @@ func TestChat_ForwardsRequestIDHeader(t *testing.T) {
 func TestChat_ForwardsMaxTokensAsNumPredict(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"oi"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`))
 	}))
 	defer srv.Close()
 

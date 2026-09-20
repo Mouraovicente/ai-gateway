@@ -27,7 +27,7 @@ func (c *Client) Tags(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("ollama: tags request failed: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		class := core.Permanent

@@ -20,7 +20,7 @@ func TestTags_ListsModelNames(t *testing.T) {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -47,7 +47,7 @@ func TestTags_ListsModelNames(t *testing.T) {
 func TestTags_NotFound_IsPermanentError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`not found`))
+		_, _ = w.Write([]byte(`not found`))
 	}))
 	defer srv.Close()
 
@@ -68,7 +68,7 @@ func TestTags_NotFound_IsPermanentError(t *testing.T) {
 func TestTags_ServiceUnavailable_IsTransientError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`unavailable`))
+		_, _ = w.Write([]byte(`unavailable`))
 	}))
 	defer srv.Close()
 

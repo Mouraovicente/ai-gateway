@@ -31,7 +31,7 @@ func TestChat_Success_ParsesCandidateAndUsageMetadata(t *testing.T) {
 			t.Fatalf("expected x-goog-api-key header, got %q", r.Header.Get("x-goog-api-key"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer srv.Close()
 
@@ -69,7 +69,7 @@ func TestChatStream_EmitsDeltasThenFinalUsage(t *testing.T) {
 			t.Fatalf("expected x-goog-api-key header, got %q", r.Header.Get("x-goog-api-key"))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer srv.Close()
 
@@ -113,7 +113,7 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer srv.Close()
 
@@ -149,7 +149,7 @@ func TestChat_PromptBlocked_ReturnsPermanentError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer srv.Close()
 
@@ -179,7 +179,7 @@ func TestChatStream_PromptBlocked_ErrorsWithNoChunks(t *testing.T) {
 	fixture := []byte("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write(fixture)
+		_, _ = w.Write(fixture)
 	}))
 	defer srv.Close()
 
@@ -265,7 +265,7 @@ func TestChatStream_TruncatedStreamIsTransientError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(sse))
+		_, _ = w.Write([]byte(sse))
 	}))
 	defer srv.Close()
 
@@ -292,9 +292,9 @@ func TestChat_ForwardsRequestIDAndMaxTokens(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("X-Request-Id")
-		json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"oi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"oi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
 	}))
 	defer srv.Close()
 

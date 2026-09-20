@@ -134,7 +134,7 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: request failed: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := httpx.ReadAllLimited(resp.Body)
 	if err != nil {
@@ -197,7 +197,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 			errs <- &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: request failed: %w", err)}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode >= 400 {
 			raw, _ := httpx.ReadAllLimited(resp.Body)
