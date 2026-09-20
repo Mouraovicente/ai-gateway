@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake local-development keys documented in README and seed script"
+regexes = [
+  '''dev-(free|standard|premium)-key''',
+  '''bench-key''',
+  '''AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=test''',
+]
