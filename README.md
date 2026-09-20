@@ -87,9 +87,9 @@ Covers items 6 (multi-model gateway) and 13 (observability spine) of the source 
 | Fallback (incl. streaming first-byte rule) | `internal/resilience/resilience.go` (`CallStream`) |
 | Rate limit | `internal/ratelimit/limiter.go` |
 | Budget | `internal/budget/budget.go` (`Reserve`/`Settle`) |
-| Traces | `internal/trace/otel.go`, span `chat.completions` with children `auth`, `budget.reserve`, `route`, `backend.call`, `budget.settle`, `usage.publish` |
+| Traces | `internal/trace/otel.go`, root span `POST /v1/chat/completions` with children `auth`, `budget.reserve`, `route`, `backend.call`, `budget.settle`, `usage.publish` |
 | `X-Request-Id` | generated in `internal/api/pipeline.go`, returned on the header and in every error body, persisted on every `trace_event` |
-| Metrics | `internal/trace/otel.go` (`requests_total`, `latency_ms`, `tokens_total`, `ttft_ms`) exported to Prometheus via the OTel Collector |
+| Metrics | `internal/trace/otel.go` (`gateway_requests_total`, `gateway_latency_ms`, `gateway_tokens_total`, `gateway_ttft_ms`) exported to Prometheus via the OTel Collector |
 | Alerts | **not yet built** — no alerting rules exist in `deploy/prometheus.yml`; see Known limitations |
 
 ## Course note (UniPDS Pós IA Aplicada) → decision in this repo
@@ -118,12 +118,15 @@ go run ./scripts/seed_tenants.go
 
 # 4. Environment (defaults shown; only override what you need)
 export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_ACCESS_KEY_ID=test     # LocalStack accepts any value
+export AWS_SECRET_ACCESS_KEY=test # LocalStack accepts any value
+export AWS_REGION=us-east-1
 export ROUTING_CONFIG=config/routing.yaml     # default
 export OLLAMA_BASE_URL=http://localhost:11434 # default from routing.yaml
 export GATEWAY_ADDR=:8080                     # default
 # export OPENROUTER_API_KEY=...   # only needed to exercise the openrouter backend
 # export GEMINI_API_KEY=...       # only needed to exercise the gemini backend
-# export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317  # optional
+# export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318  # optional (OTLP/HTTP, not the gRPC 4317 port)
 
 # 5. Run
 go run ./cmd/gateway
@@ -172,11 +175,11 @@ Grafana at `http://localhost:3000`, dashboard "ai-gateway" provisioned from `dep
 
 | Endpoint | Auth | Notes |
 |---|---|---|
-| `POST /v1/chat/completions` | required | OpenAI-shaped request/response; `stream: true` for SSE |
+| `POST /v1/chat/completions` | required | OpenAI-shaped request/response; `stream: true` for SSE; optional `max_tokens` (1-32768, rejected outside that range with 400 `invalid_request`) |
 | `GET /v1/models` | none | lists aliases from `config/routing.yaml` |
 | `GET /healthz` | none | liveness |
 | `GET /readyz` | none | checks the store and at least one backend |
-| `GET /stats` | required | latency/token percentiles from the in-memory window |
+| `GET /stats` | required | latency/token percentiles from the in-memory window, scoped to the caller's own tenant plus a global `total` rollup (no other tenant's routes or ids) |
 
 Error types (JSON body `{"error":{"type","message","request_id"}}`, plus HTTP status):
 
@@ -222,12 +225,14 @@ Error types (JSON body `{"error":{"type","message","request_id"}}`, plus HTTP st
 - Unit tests: `go test -race ./...` — no external dependency, run in CI.
 - Integration tests: `go test -tags integration ./...` — needs LocalStack up (`docker compose up -d localstack`); exercises DynamoDB/SQS code paths.
 - `-race` runs in CI, not locally on Windows (no `gcc` in the dev environment used to build this repo).
-- Fixtures: Ollama and OpenRouter fixtures (`internal/backend/{ollama,openrouter}/testdata/*.json`) were recorded against real calls. Gemini's fixture (`internal/backend/gemini/testdata/generate_success.json`) is synthetic, pending a real `GEMINI_API_KEY` to record a live one.
+- Fixtures: Ollama's fixtures and OpenRouter's non-streaming success fixture (`internal/backend/{ollama,openrouter}/testdata/*.json`) were recorded against real calls. OpenRouter's streaming fixture and `chat_error.json` (429) are synthetic, as is Gemini's fixture (`internal/backend/gemini/testdata/generate_success.json`), pending a real `GEMINI_API_KEY`/streaming capture to record live ones.
 - CI jobs (`.github/workflows/ci.yml`): `test` (`go vet`, `go test -race`, `golangci-lint`, `gitleaks`), `integration` (LocalStack + `-tags integration`), `terraform-plan` (`tflocal plan` with `enable_fargate=false`, DynamoDB + SQS only).
 
 ## Deploy
 
 See `docs/deploy-fargate.md` for a real ECS Fargate deploy (manual `apply` against a real AWS account, outside LocalStack). Fargate is behind the `enable_fargate` Terraform flag, off by default and off in CI — LocalStack Community doesn't emulate ECS/ALB well enough to validate it. Provider secrets (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`) are passed by ARN via `provider_secret_arns`, resolved from Secrets Manager, never as plain task-definition environment variables.
+
+The ALB always terminates TLS: HTTPS:443 forwards to the service, HTTP:80 redirects (301) to HTTPS. `acm_certificate_arn` (an ACM certificate for the gateway's domain, requested and validated beforehand) is required whenever `enable_fargate=true`.
 
 Cost warning: Fargate (512 CPU / 1024 MB, 1 task) + an ALB running 24/7 costs on the order of tens of USD/month even at low traffic — don't leave it running without a reason.
 
@@ -237,9 +242,9 @@ Cost warning: Fargate (512 CPU / 1024 MB, 1 task) + an ALB running 24/7 costs on
 - **LocalStack Community lacks full DynamoDB IAM/TTL parity** with real AWS — validate against a real account before relying on it in production (see `docs/deploy-fargate.md`).
 - **Direct-target metrics collapse to `direct`**: OTel labels are limited to the aliases/tiers in `config/routing.yaml` to bound cardinality, so a request routed straight at a backend (bypassing an alias) loses per-model granularity in metrics.
 - **Gemini fixtures are synthetic**, recorded without a live API key; behavior may diverge from the real API until a recorded fixture replaces them.
-- **`attempts[].latency_ms` is not always populated** per attempt in every code path (deferred from Task 12/13 fix rounds).
 - **No alerting rules yet** — Prometheus/Grafana are set up for dashboards, not alerts.
-- **Budget reserve can orphan on `PutItem` failure**: `Reserve` increments `used` before writing the reservation row; if that `PutItem` fails, the increment isn't rolled back automatically (mitigated by the reservation TTL, not yet by an explicit compensating `ADD used -:est`).
+
+`max_tokens` (optional, 1-32768) is validated and forwarded to every backend's native field (Ollama `options.num_predict`, OpenRouter `max_tokens`, Gemini `generationConfig.maxOutputTokens`) and used in the pre-call budget estimate. `GET /stats` returns only the caller's own tenant entries plus a tenant-free global `total`. CI's integration job provisions LocalStack for real before testing: it waits for the health endpoint, then runs `tflocal apply` against `infra/` and seeds tenants, instead of testing against tables/queues that were never created.
 
 Phase 2: a semantic cache (embeddings + vector store) for repeated prompts — out of scope today. It's added once `llm-loadgen` (a companion load generator) shows a repeated-prompt ratio that justifies the cost of maintaining a vector index.
 
