@@ -48,6 +48,12 @@ func TestCall_SucceedsOnFirstBackend(t *testing.T) {
 	if ollama.calls != 1 {
 		t.Fatalf("expected exactly 1 call on success, got %d", ollama.calls)
 	}
+	if attempts[0].StartedAt.IsZero() {
+		t.Fatalf("expected attempts[0].StartedAt to be set, got zero value")
+	}
+	if attempts[0].LatencyMs < 0 {
+		t.Fatalf("expected attempts[0].LatencyMs >= 0, got %d", attempts[0].LatencyMs)
+	}
 }
 
 func TestCall_RetriesTransientThenFallsBackToNextTarget(t *testing.T) {
@@ -76,6 +82,14 @@ func TestCall_RetriesTransientThenFallsBackToNextTarget(t *testing.T) {
 	}
 	if len(attempts) != 3 {
 		t.Fatalf("expected 3 attempts recorded (2 ollama + 1 openrouter), got %d: %+v", len(attempts), attempts)
+	}
+	for i, a := range attempts {
+		if a.StartedAt.IsZero() {
+			t.Errorf("attempts[%d].StartedAt is zero, want set", i)
+		}
+		if a.LatencyMs < 0 {
+			t.Errorf("attempts[%d].LatencyMs = %d, want >= 0", i, a.LatencyMs)
+		}
 	}
 }
 
@@ -167,6 +181,12 @@ func TestCallStream_SucceedsOnFirstTarget(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].Status != 200 {
 		t.Fatalf("unexpected attempts: %+v", attempts)
+	}
+	if attempts[0].StartedAt.IsZero() {
+		t.Fatalf("expected attempts[0].StartedAt to be set, got zero value")
+	}
+	if attempts[0].LatencyMs < 0 {
+		t.Fatalf("expected attempts[0].LatencyMs >= 0, got %d", attempts[0].LatencyMs)
 	}
 }
 

@@ -243,17 +243,22 @@ func main() {
 		if err := server.Shutdown(timeoutCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
-		otelShutdownCtx, cancelOtel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelOtel()
+		// Independent 5s timeouts: a stuck trace exporter must not delay (or
+		// get short-changed by) the metrics provider's own shutdown, and
+		// vice versa.
 		if tracerProvider != nil {
-			if err := tracerProvider.Shutdown(otelShutdownCtx); err != nil {
+			tracerShutdownCtx, cancelTracer := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := tracerProvider.Shutdown(tracerShutdownCtx); err != nil {
 				logger.Error("tracer provider shutdown failed", "error", err)
 			}
+			cancelTracer()
 		}
 		if meterProvider != nil {
-			if err := meterProvider.Shutdown(otelShutdownCtx); err != nil {
+			meterShutdownCtx, cancelMeter := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := meterProvider.Shutdown(meterShutdownCtx); err != nil {
 				logger.Error("meter provider shutdown failed", "error", err)
 			}
+			cancelMeter()
 		}
 	}()
 

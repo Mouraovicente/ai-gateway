@@ -26,7 +26,6 @@ services:
       - ./deploy/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
     ports:
       - "4318:4318"
-      - "8889:8889"
 
   tempo:
     image: grafana/tempo:2.5.0

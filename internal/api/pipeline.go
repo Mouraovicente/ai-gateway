@@ -65,9 +65,18 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		start := time.Now()
 		// requestSpan is the root span of the trace: metadata only
 		// (request_id/tenant_id/tier/alias/provider/model/http.status_code/
-		// error.class), never messages/prompts/completions/keys.
+		// error.class), never messages/prompts/completions/keys. Every
+		// exit path below goes through writeErr or sets httpStatus directly
+		// (success, streaming) so this single deferred func can record the
+		// real wire status on the root span regardless of which path ran.
 		ctx, requestSpan := tracer.Start(r.Context(), "POST /v1/chat/completions")
 		defer requestSpan.End()
+		var httpStatus int
+		defer func() {
+			if httpStatus != 0 {
+				requestSpan.SetAttributes(otelattr.Int("http.status_code", httpStatus))
+			}
+		}()
 		// traceCtx survives a client disconnect: trace events, the budget
 		// settle and the usage publish must still happen even when the
 		// request context is already cancelled by the time we get there.
@@ -81,12 +90,18 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				slog.Error("trace: failed to record event", "request_id", requestID, "seq", seq, "type", string(eventType), "error", err.Error())
 			}
 		}
+		// writeErr is the single write path for every error response below,
+		// so httpStatus (and therefore the root span's http.status_code) is
+		// always in sync with what actually went out on the wire.
+		writeErr := func(status int, code, msg string) {
+			httpStatus = status
+			WriteError(w, requestID, status, code, msg)
+		}
 
 		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if apiKey == "" {
 			emit(trace.Auth, "auth", map[string]any{"status": "denied", "reason": "missing_header"})
-			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusUnauthorized))
-			WriteError(w, requestID, http.StatusUnauthorized, "missing_api_key", "missing Authorization header")
+			writeErr(http.StatusUnauthorized, "missing_api_key", "missing Authorization header")
 			return
 		}
 		authCtx, authSpan := tracer.Start(ctx, "auth")
@@ -94,8 +109,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		authSpan.End()
 		if err != nil {
 			emit(trace.Auth, "auth", map[string]any{"status": "denied"})
-			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusUnauthorized))
-			WriteError(w, requestID, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+			writeErr(http.StatusUnauthorized, "invalid_api_key", "invalid API key")
 			return
 		}
 		emit(trace.Auth, "auth", map[string]any{"tenant_id": tenant.ID, "tier": tenant.Tier})
@@ -104,7 +118,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		if allowed, retryAfter := p.RateLimit.Allow(tenant.ID, tenant.RPMLimit); !allowed {
 			emit(trace.RateLimit, "ratelimit", map[string]any{"tenant_id": tenant.ID, "retry_after": retryAfter})
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-			WriteError(w, requestID, http.StatusTooManyRequests, "rate_limited", "too many requests")
+			writeErr(http.StatusTooManyRequests, "rate_limited", "too many requests")
 			return
 		}
 		emit(trace.RateLimit, "ratelimit", map[string]any{"tenant_id": tenant.ID, "status": "allowed"})
@@ -119,15 +133,15 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				status = http.StatusRequestEntityTooLarge
 				msg = "request body too large"
 			}
-			WriteError(w, requestID, status, "invalid_request", msg)
+			writeErr(status, "invalid_request", msg)
 			return
 		}
 		if len(body.Messages) == 0 {
-			WriteError(w, requestID, http.StatusBadRequest, "invalid_request", "messages must not be empty")
+			writeErr(http.StatusBadRequest, "invalid_request", "messages must not be empty")
 			return
 		}
 		if body.Model == "" {
-			WriteError(w, requestID, http.StatusBadRequest, "invalid_request", "model must not be empty")
+			writeErr(http.StatusBadRequest, "invalid_request", "model must not be empty")
 			return
 		}
 
@@ -148,10 +162,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		if err != nil {
 			emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "status": "denied"})
 			if errors.Is(err, budget.ErrBudgetExceeded) {
-				WriteError(w, requestID, http.StatusPaymentRequired, "budget_exceeded", "monthly token budget exceeded")
+				writeErr(http.StatusPaymentRequired, "budget_exceeded", "monthly token budget exceeded")
 				return
 			}
-			WriteError(w, requestID, http.StatusInternalServerError, "internal_error", "failed to reserve budget")
+			writeErr(http.StatusInternalServerError, "internal_error", "failed to reserve budget")
 			return
 		}
 		emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "reservation_id": reservation.ID, "estimated_tokens": estimated})
@@ -191,7 +205,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 					if a.Err != nil {
 						attemptStatus = "error"
 					}
-					attemptRecords = append(attemptRecords, usage.AttemptRecord{Provider: a.Provider, Model: a.Model, Status: attemptStatus})
+					attemptRecords = append(attemptRecords, usage.AttemptRecord{Provider: a.Provider, Model: a.Model, Status: attemptStatus, LatencyMs: a.LatencyMs})
 				}
 				event := usage.Event{
 					EventVersion:     1,
@@ -238,13 +252,19 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			emit(trace.Route, "router", map[string]any{"status": "error"})
 			status = "error"
 			errorClass = "permanent"
-			writeRouterError(w, requestID, err)
+			httpStatus = writeRouterError(w, requestID, err)
 			return
 		}
 		emit(trace.Route, "router", map[string]any{"targets": len(targets)})
 
 		if body.Stream {
-			serveStreamPipeline(w, r, p, tracer, targets, chatReq, requestID, &respUsage, &target, &attempts, &ttftMs, &status, &errorClass, emit)
+			serveStreamPipeline(streamArgs{
+				w: w, r: r, ctx: ctx, p: p, tracer: tracer, tenant: tenant, alias: body.Model,
+				targets: targets, chatReq: chatReq, requestID: requestID,
+				usage: &respUsage, outTarget: &target, outAttempts: &attempts, outTTFTMs: &ttftMs,
+				outStatus: &status, outErrorClass: &errorClass, outHTTPStatus: &httpStatus,
+				start: start, emit: emit,
+			})
 			return
 		}
 
@@ -262,6 +282,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				// billing/consumption pipeline sees every request), but as
 				// status "client_closed" with no error_class, and it must
 				// never feed Stats (a disconnect isn't a real latency sample).
+				// No httpStatus is set: no bytes ever reached the client.
 				status = "client_closed"
 				errorClass = ""
 				return
@@ -269,44 +290,28 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			emit(trace.Error, "resilience", map[string]any{"reason": "all_backends_failed"})
 			status = "error"
 			errorClass = errorClassFromAttempts(attempts)
-			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusBadGateway), otelattr.String("error.class", errorClass))
-			if p.Metrics != nil {
-				metricAttrs := metric.WithAttributes(
-					otelattr.String("route", body.Model),
-					otelattr.String("model", body.Model),
-					otelattr.String("tenant", tenant.ID),
-					otelattr.String("status", status),
-				)
-				p.Metrics.RequestsTotal.Add(ctx, 1, metricAttrs)
-				p.Metrics.LatencyMs.Record(ctx, float64(time.Since(start).Milliseconds()), metricAttrs)
-			}
+			httpStatus = http.StatusBadGateway
+			requestSpan.SetAttributes(otelattr.String("error.class", errorClass))
+			recordRequestMetrics(ctx, p.Metrics, requestMetricsArgs{
+				routing: p.Routing, alias: body.Model, resolvedModel: lastAttemptModel(attempts),
+				tenantID: tenant.ID, httpStatus: httpStatus, latencyMs: time.Since(start),
+			})
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
 		}
 		emit(trace.BackendResult, "resilience", map[string]any{"provider": target.Provider, "model": target.Model, "status": "ok", "prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens})
 
 		respUsage = resp.Usage
+		httpStatus = http.StatusOK
 		requestSpan.SetAttributes(
 			otelattr.String("provider", target.Provider),
 			otelattr.String("model", target.Model),
-			otelattr.Int("http.status_code", http.StatusOK),
 		)
-		if p.Metrics != nil {
-			metricAttrs := metric.WithAttributes(
-				otelattr.String("route", body.Model),
-				otelattr.String("model", target.Model),
-				otelattr.String("tenant", tenant.ID),
-				otelattr.String("status", status),
-			)
-			p.Metrics.RequestsTotal.Add(ctx, 1, metricAttrs)
-			p.Metrics.LatencyMs.Record(ctx, float64(time.Since(start).Milliseconds()), metricAttrs)
-			p.Metrics.TokensTotal.Add(ctx, int64(resp.Usage.PromptTokens), metric.WithAttributes(
-				otelattr.String("route", body.Model), otelattr.String("model", target.Model), otelattr.String("tenant", tenant.ID), otelattr.String("kind", "prompt"),
-			))
-			p.Metrics.TokensTotal.Add(ctx, int64(resp.Usage.CompletionTokens), metric.WithAttributes(
-				otelattr.String("route", body.Model), otelattr.String("model", target.Model), otelattr.String("tenant", tenant.ID), otelattr.String("kind", "completion"),
-			))
-		}
+		recordRequestMetrics(ctx, p.Metrics, requestMetricsArgs{
+			routing: p.Routing, alias: body.Model, resolvedModel: target.Model,
+			tenantID: tenant.ID, httpStatus: httpStatus, latencyMs: time.Since(start),
+			promptTokens: resp.Usage.PromptTokens, completionTokens: resp.Usage.CompletionTokens,
+		})
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -316,6 +321,76 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			"usage":   map[string]int{"prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens},
 		})
 	})
+}
+
+// lastAttemptModel returns the model name of the last resilience attempt, or
+// "" if none were made — used so an all_backends_failed metric/label can
+// still reflect which model was actually (attempted to be) reached.
+func lastAttemptModel(attempts []resilience.Attempt) string {
+	if len(attempts) == 0 {
+		return ""
+	}
+	return attempts[len(attempts)-1].Model
+}
+
+// metricLabels returns the "route" and "model" metric label values per the
+// controller's cardinality rule: both must be bounded by config, never by
+// arbitrary client input. route is the alias the request used (bounded by
+// routing.yaml's Aliases) when it used one; otherwise (a direct
+// "provider/model" target) route is the literal "direct". model is the
+// resolved backend model when it came from that alias's cascade (also
+// bounded by routing.yaml), or the literal "direct" otherwise.
+func metricLabels(routing *config.Routing, alias, resolvedModel string) (route, model string) {
+	if routing != nil {
+		if _, ok := routing.Aliases[alias]; ok {
+			return alias, resolvedModel
+		}
+	}
+	return "direct", "direct"
+}
+
+// requestMetricsArgs bundles recordRequestMetrics' inputs so the call sites
+// (success, all_backends_failed, streaming) stay one-liners.
+type requestMetricsArgs struct {
+	routing                        *config.Routing
+	alias, resolvedModel, tenantID string
+	httpStatus                     int
+	latencyMs                      time.Duration
+	promptTokens, completionTokens int
+	ttftMs                         time.Duration
+	recordTTFT                     bool
+}
+
+// recordRequestMetrics records gateway_requests_total, gateway_latency_ms,
+// gateway_tokens_total (split prompt/completion) and, when recordTTFT is
+// set, gateway_ttft_ms — a no-op when metrics is nil (OTel disabled). status
+// is always the literal HTTP status code returned to the client, per the
+// controller's cardinality rule (never a free-form ok/error string).
+func recordRequestMetrics(ctx context.Context, metrics *trace.Metrics, a requestMetricsArgs) {
+	if metrics == nil {
+		return
+	}
+	route, model := metricLabels(a.routing, a.alias, a.resolvedModel)
+	statusLabel := strconv.Itoa(a.httpStatus)
+	baseAttrs := metric.WithAttributes(
+		otelattr.String("route", route),
+		otelattr.String("model", model),
+		otelattr.String("tenant", a.tenantID),
+		otelattr.String("status", statusLabel),
+	)
+	metrics.RequestsTotal.Add(ctx, 1, baseAttrs)
+	metrics.LatencyMs.Record(ctx, float64(a.latencyMs.Milliseconds()), baseAttrs)
+	if a.promptTokens > 0 || a.completionTokens > 0 {
+		metrics.TokensTotal.Add(ctx, int64(a.promptTokens), metric.WithAttributes(
+			otelattr.String("route", route), otelattr.String("model", model), otelattr.String("tenant", a.tenantID), otelattr.String("kind", "prompt"),
+		))
+		metrics.TokensTotal.Add(ctx, int64(a.completionTokens), metric.WithAttributes(
+			otelattr.String("route", route), otelattr.String("model", model), otelattr.String("tenant", a.tenantID), otelattr.String("kind", "completion"),
+		))
+	}
+	if a.recordTTFT {
+		metrics.TTFTMs.Record(ctx, float64(a.ttftMs.Milliseconds()), baseAttrs)
+	}
 }
 
 // isClientCancelled reports whether err (from resilience.Call/CallStream)
@@ -328,20 +403,52 @@ func isClientCancelled(ctx context.Context, err error) bool {
 
 // traceBackendCallSpan records one "backend.call" child span per resilience
 // attempt, carrying only metadata (provider/model/attempt index/status) —
-// never request/response content.
+// never request/response content. The span is backdated to a.StartedAt and
+// ended at a.StartedAt+a.LatencyMs, so it shows the backend call's real
+// duration instead of a zero-length span created after the fact.
 func traceBackendCallSpan(ctx context.Context, tracer oteltrace.Tracer, index int, a resilience.Attempt) {
 	attemptStatus := "ok"
 	if a.Err != nil {
 		attemptStatus = "error"
 	}
-	_, span := tracer.Start(ctx, "backend.call")
+	startedAt := a.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	_, span := tracer.Start(ctx, "backend.call", oteltrace.WithTimestamp(startedAt))
 	span.SetAttributes(
 		otelattr.String("provider", a.Provider),
 		otelattr.String("model", a.Model),
 		otelattr.Int("attempt", index+1),
 		otelattr.String("status", attemptStatus),
 	)
-	span.End()
+	span.End(oteltrace.WithTimestamp(startedAt.Add(time.Duration(a.LatencyMs) * time.Millisecond)))
+}
+
+// streamArgs bundles serveStreamPipeline's inputs (it outgrew a positional
+// parameter list once OTel needed tenant/alias/http-status plumbed through
+// too).
+type streamArgs struct {
+	w         http.ResponseWriter
+	r         *http.Request
+	ctx       context.Context // the span-carrying context from the root span, NOT r.Context()
+	p         *Pipeline
+	tracer    oteltrace.Tracer
+	tenant    core.Tenant
+	alias     string
+	targets   []core.BackendTarget
+	chatReq   core.ChatRequest
+	requestID string
+	start     time.Time
+	emit      func(trace.EventType, string, map[string]any)
+
+	usage         *core.Usage
+	outTarget     *core.BackendTarget
+	outAttempts   *[]resilience.Attempt
+	outTTFTMs     *int
+	outStatus     *string
+	outErrorClass *string
+	outHTTPStatus *int
 }
 
 // serveStreamPipeline runs the streaming cascade through resilience.CallStream,
@@ -355,36 +462,45 @@ func traceBackendCallSpan(ctx context.Context, tracer oteltrace.Tracer, index in
 // without writing an error event to a socket nobody is reading from anymore.
 // usage is filled in from the final reported core.Usage (prompt/completion
 // split intact) so the caller's deferred budget.Settle and usage_publish see
-// real, not estimated, numbers.
-func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, tracer oteltrace.Tracer, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, outTarget *core.BackendTarget, outAttempts *[]resilience.Attempt, outTTFTMs *int, outStatus *string, outErrorClass *string, emit func(trace.EventType, string, map[string]any)) {
+// real, not estimated, numbers. Every span/cancellation check below uses
+// args.ctx (the root span's context, derived from r.Context()), never
+// args.r.Context() directly, so backend.call/resilience spans nest under the
+// root span instead of starting a disconnected trace.
+func serveStreamPipeline(args streamArgs) {
+	w, requestID := args.w, args.requestID
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		*args.outHTTPStatus = http.StatusInternalServerError
 		WriteError(w, requestID, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support flushing")
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	// The SSE headers are already on the wire at this point: every outcome
+	// from here on (success or an in-band "backend_stream_failed" event) is
+	// still wire status 200, so that is what the root span/metrics record.
+	*args.outHTTPStatus = http.StatusOK
 
 	resolve := func(target core.BackendTarget) (core.StreamBackend, error) {
-		backend, ok := p.Backends[target.Provider]
+		backend, ok := args.p.Backends[target.Provider]
 		if !ok {
 			return nil, fmt.Errorf("resilience: no backend registered for provider %q", target.Provider)
 		}
 		return backend, nil
 	}
 
-	start := time.Now()
+	streamStart := time.Now()
 	var ttfb time.Duration
 	ttfbSet := false
 	onChunk := func(chunk core.ChatChunk) error {
 		select {
-		case <-r.Context().Done():
-			return r.Context().Err()
+		case <-args.ctx.Done():
+			return args.ctx.Err()
 		default:
 		}
 		if !ttfbSet && chunk.Delta != "" {
-			ttfb = time.Since(start)
+			ttfb = time.Since(streamStart)
 			ttfbSet = true
 		}
 		payload, _ := json.Marshal(map[string]any{
@@ -397,39 +513,56 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, tr
 		return nil
 	}
 
-	result, attempts, streamErr := resilience.CallStream(r.Context(), targets, resolve, chatReq, onChunk)
+	result, attempts, streamErr := resilience.CallStream(args.ctx, args.targets, resolve, args.chatReq, onChunk)
 	for i, a := range attempts {
-		traceBackendCallSpan(r.Context(), tracer, i, a)
-		emit(trace.BackendAttempt, "resilience", attemptPayload(a))
+		traceBackendCallSpan(args.ctx, args.tracer, i, a)
+		args.emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 	}
-	*usage = result
-	*outAttempts = attempts
-	*outTTFTMs = int(ttfb.Milliseconds())
+	*args.usage = result
+	*args.outAttempts = attempts
+	*args.outTTFTMs = int(ttfb.Milliseconds())
 
+	var succeeded resilience.Attempt
 	if streamErr == nil {
-		var succeeded resilience.Attempt
 		for _, a := range attempts {
 			if a.Err == nil {
 				succeeded = a
 			}
 		}
-		*outTarget = core.BackendTarget{Provider: succeeded.Provider, Model: succeeded.Model}
-		emit(trace.BackendResult, "resilience", map[string]any{
+		*args.outTarget = core.BackendTarget{Provider: succeeded.Provider, Model: succeeded.Model}
+		args.emit(trace.BackendResult, "resilience", map[string]any{
 			"provider": succeeded.Provider, "model": succeeded.Model, "status": "ok",
-			"latency_ms": time.Since(start).Milliseconds(), "ttft_ms": ttfb.Milliseconds(),
+			"latency_ms": time.Since(streamStart).Milliseconds(), "ttft_ms": ttfb.Milliseconds(),
 			"prompt_tokens": result.PromptTokens, "completion_tokens": result.CompletionTokens,
 		})
 	}
 
-	if streamErr != nil && isClientCancelled(r.Context(), streamErr) {
-		emit(trace.Error, "resilience", map[string]any{"reason": "client_closed"})
+	if streamErr != nil && isClientCancelled(args.ctx, streamErr) {
+		args.emit(trace.Error, "resilience", map[string]any{"reason": "client_closed"})
 		// Same rule as the non-streaming cancel path: still publish a
 		// usage_event (status "client_closed", no error_class), but never
-		// feed Stats with a disconnect.
-		*outStatus = "client_closed"
-		*outErrorClass = ""
+		// feed Stats with a disconnect, and skip metrics same as non-streaming.
+		*args.outStatus = "client_closed"
+		*args.outErrorClass = ""
 		return
 	}
+
+	// Record metrics for every outcome that actually reached (or tried to
+	// reach) a backend — success or all_backends_failed/stream-failed —
+	// mirroring the non-streaming path. TTFTMs is recorded here specifically
+	// because streaming is the only path with a real time-to-first-byte;
+	// the non-streaming path has no meaningful TTFT distinct from full
+	// latency, so it is skipped there.
+	resolvedModel := succeeded.Model
+	if resolvedModel == "" {
+		resolvedModel = lastAttemptModel(attempts)
+	}
+	recordRequestMetrics(args.ctx, args.p.Metrics, requestMetricsArgs{
+		routing: args.p.Routing, alias: args.alias, resolvedModel: resolvedModel,
+		tenantID: args.tenant.ID, httpStatus: *args.outHTTPStatus, latencyMs: time.Since(streamStart),
+		promptTokens: result.PromptTokens, completionTokens: result.CompletionTokens,
+		ttftMs: ttfb, recordTTFT: ttfbSet,
+	})
 
 	if streamErr != nil {
 		// reason is the trace_event's diagnostic label (which cascade stage
@@ -440,9 +573,10 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, tr
 		if errors.Is(streamErr, resilience.ErrStreamFailedAfterFirstByte) {
 			reason = "stream_failed_after_first_byte"
 		}
-		*outStatus = "error"
-		*outErrorClass = errorClassFromAttempts(attempts)
-		emit(trace.Error, "resilience", map[string]any{"reason": reason})
+		*args.outStatus = "error"
+		*args.outErrorClass = errorClassFromAttempts(attempts)
+		oteltrace.SpanFromContext(args.ctx).SetAttributes(otelattr.String("error.class", *args.outErrorClass))
+		args.emit(trace.Error, "resilience", map[string]any{"reason": reason})
 		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": scrubErrorText(streamErr), "request_id": requestID}})
 		fmt.Fprintf(w, "data: %s\n\n", payload)
 		flusher.Flush()

@@ -10,11 +10,11 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	oteltrace "go.opentelemetry.io/otel/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // gatewayResource tags every exported span/metric with service.name=ai-gateway,
@@ -84,13 +84,6 @@ func NewMeterProvider(ctx context.Context, otlpEndpoint string) (*sdkmetric.Mete
 // the global no-op tracer, so callers never need a nil check.
 func Tracer() oteltrace.Tracer {
 	return otel.Tracer(tracerName)
-}
-
-// StartSpan is a thin wrapper around tracer.Start that attaches attrs in one
-// call, kept here so pipeline.go's instrumentation stays a one-liner per
-// stage instead of repeating oteltrace.WithAttributes everywhere.
-func StartSpan(ctx context.Context, tracer oteltrace.Tracer, name string, attrs ...oteltrace.SpanStartOption) (context.Context, oteltrace.Span) {
-	return tracer.Start(ctx, name, attrs...)
 }
 
 // Metrics holds the instruments the spec requires:

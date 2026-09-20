@@ -79,18 +79,23 @@ func errorClassFromAttempts(attempts []resilience.Attempt) string {
 }
 
 // writeRouterError maps a router.Resolve error to its HTTP status/type per
-// the controller's binding decisions for Task 11.
-func writeRouterError(w http.ResponseWriter, requestID string, err error) {
+// the controller's binding decisions for Task 11, and returns the status
+// written so the caller can record it (e.g. on the OTel root span).
+func writeRouterError(w http.ResponseWriter, requestID string, err error) int {
 	var unknownProvider *router.ErrUnknownProvider
+	var status int
+	var errType string
 	switch {
 	case errors.Is(err, router.ErrDirectTargetForbidden):
-		WriteError(w, requestID, http.StatusForbidden, "tier_forbidden", err.Error())
+		status, errType = http.StatusForbidden, "tier_forbidden"
 	case errors.As(err, &unknownProvider):
-		WriteError(w, requestID, http.StatusBadRequest, "unknown_provider", err.Error())
+		status, errType = http.StatusBadRequest, "unknown_provider"
 	default:
 		// router.ErrUnknownModel and anything else Resolve can return.
-		WriteError(w, requestID, http.StatusBadRequest, "unknown_model", err.Error())
+		status, errType = http.StatusBadRequest, "unknown_model"
 	}
+	WriteError(w, requestID, status, errType, err.Error())
+	return status
 }
 
 // writeAllBackendsFailed writes the 502 all_backends_failed body, including

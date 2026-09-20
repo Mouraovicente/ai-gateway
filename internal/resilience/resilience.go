@@ -40,12 +40,16 @@ type FullBackend interface {
 }
 
 // Attempt records one call made while resolving a request, for the
-// all_backends_failed error body and for usage_event.attempts.
+// all_backends_failed error body, usage_event.attempts and the OTel
+// backend.call span (StartedAt/LatencyMs give it a real, non-zero-duration
+// timestamp instead of being created after the fact with no duration).
 type Attempt struct {
-	Provider string
-	Model    string
-	Status   int
-	Err      error
+	Provider  string
+	Model     string
+	Status    int
+	Err       error
+	StartedAt time.Time
+	LatencyMs int
 }
 
 // Call tries each target in order. For a given target, it retries up to
@@ -64,9 +68,11 @@ func Call(ctx context.Context, backends map[string]Backend, targets []core.Backe
 		}
 
 		for attempt := 0; attempt < maxAttemptsPerBackend; attempt++ {
+			startedAt := time.Now()
 			resp, err := backend.Chat(ctx, target.Model, req)
+			latencyMs := int(time.Since(startedAt).Milliseconds())
 			if err == nil {
-				attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: 200})
+				attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: 200, StartedAt: startedAt, LatencyMs: latencyMs})
 				return resp, target, attempts, nil
 			}
 
@@ -75,7 +81,7 @@ func Call(ctx context.Context, backends map[string]Backend, targets []core.Backe
 			if errors.As(err, &be) {
 				status = be.Status
 			}
-			attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: status, Err: err})
+			attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: status, Err: err, StartedAt: startedAt, LatencyMs: latencyMs})
 
 			if !errors.As(err, &be) || !be.IsTransient() {
 				break // permanent error: stop retrying this backend, move to next target
@@ -126,10 +132,12 @@ func CallStream(ctx context.Context, targets []core.BackendTarget, resolve func(
 		}
 
 		for attempt := 0; attempt < maxAttemptsPerBackend; attempt++ {
+			startedAt := time.Now()
 			usage, firstByteSent, streamErr := runStream(ctx, backend, target.Model, req, onChunk)
+			latencyMs := int(time.Since(startedAt).Milliseconds())
 
 			if streamErr == nil {
-				attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: 200})
+				attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: 200, StartedAt: startedAt, LatencyMs: latencyMs})
 				return usage, attempts, nil
 			}
 
@@ -138,7 +146,7 @@ func CallStream(ctx context.Context, targets []core.BackendTarget, resolve func(
 			if errors.As(streamErr, &be) {
 				status = be.Status
 			}
-			attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: status, Err: streamErr})
+			attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: status, Err: streamErr, StartedAt: startedAt, LatencyMs: latencyMs})
 
 			if firstByteSent {
 				return usage, attempts, fmt.Errorf("%w: %v", ErrStreamFailedAfterFirstByte, streamErr)
