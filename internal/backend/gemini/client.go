@@ -34,7 +34,8 @@ type content struct {
 }
 
 type requestBody struct {
-	Contents []content `json:"contents"`
+	SystemInstruction *content  `json:"systemInstruction,omitempty"`
+	Contents          []content `json:"contents"`
 }
 
 type candidate struct {
@@ -47,21 +48,48 @@ type usageMetadata struct {
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 }
 
-type responseBody struct {
-	Candidates    []candidate    `json:"candidates"`
-	UsageMetadata *usageMetadata `json:"usageMetadata"`
+type promptFeedback struct {
+	BlockReason string `json:"blockReason"`
 }
 
-func toContents(messages []core.Message) []content {
+type responseBody struct {
+	Candidates     []candidate     `json:"candidates"`
+	UsageMetadata  *usageMetadata  `json:"usageMetadata"`
+	PromptFeedback *promptFeedback `json:"promptFeedback"`
+}
+
+// toRequestBody splits messages into Gemini's contents (user/model turns)
+// and systemInstruction (system messages don't belong in contents; Gemini
+// rejects role "system" there), concatenating multiple system messages.
+func toRequestBody(messages []core.Message) requestBody {
 	contents := make([]content, 0, len(messages))
+	var systemParts []string
 	for _, m := range messages {
+		if m.Role == "system" {
+			systemParts = append(systemParts, m.Content)
+			continue
+		}
 		role := m.Role
 		if role == "assistant" {
 			role = "model" // Gemini uses "model", not "assistant"
 		}
 		contents = append(contents, content{Role: role, Parts: []part{{Text: m.Content}}})
 	}
-	return contents
+	body := requestBody{Contents: contents}
+	if len(systemParts) > 0 {
+		body.SystemInstruction = &content{Parts: []part{{Text: strings.Join(systemParts, "\n")}}}
+	}
+	return body
+}
+
+// blockedError builds the Permanent BackendError for a 200 response that
+// carries no candidates: either the prompt was blocked (promptFeedback set)
+// or the response is simply empty. Neither is worth retrying.
+func blockedError(status int, feedback *promptFeedback) *core.BackendError {
+	if feedback != nil && feedback.BlockReason != "" {
+		return &core.BackendError{Class: core.Permanent, Status: status, Err: fmt.Errorf("gemini: prompt blocked (%s)", feedback.BlockReason)}
+	}
+	return &core.BackendError{Class: core.Permanent, Status: status, Err: fmt.Errorf("gemini: empty candidates")}
 }
 
 func classify(status int) core.ErrorClass {
@@ -73,7 +101,7 @@ func classify(status int) core.ErrorClass {
 
 // Chat performs a single non-streaming call to Gemini's generateContent.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
-	body, err := json.Marshal(requestBody{Contents: toContents(req.Messages)})
+	body, err := json.Marshal(toRequestBody(req.Messages))
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 	}
@@ -103,8 +131,11 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: parsing response: %w", err)}
 	}
-	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
-		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: no candidates in response")}
+	if len(parsed.Candidates) == 0 {
+		return core.ChatResponse{}, blockedError(resp.StatusCode, parsed.PromptFeedback)
+	}
+	if len(parsed.Candidates[0].Content.Parts) == 0 {
+		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("gemini: candidate has no content parts")}
 	}
 
 	usage := core.Usage{}
@@ -127,7 +158,7 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		defer close(chunks)
 		defer close(errs)
 
-		body, err := json.Marshal(requestBody{Contents: toContents(req.Messages)})
+		body, err := json.Marshal(toRequestBody(req.Messages))
 		if err != nil {
 			errs <- &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("gemini: marshaling request: %w", err)}
 			return
@@ -167,7 +198,8 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 				return
 			}
 			if len(parsed.Candidates) == 0 {
-				continue
+				errs <- blockedError(resp.StatusCode, parsed.PromptFeedback)
+				return
 			}
 			cand := parsed.Candidates[0]
 			var text string

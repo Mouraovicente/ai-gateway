@@ -3,6 +3,7 @@ package gemini
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -139,5 +140,119 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for ChatStream goroutine to finish after ctx cancellation")
+	}
+}
+
+func TestChat_PromptBlocked_ReturnsPermanentError(t *testing.T) {
+	fixture := []byte(`{"promptFeedback":{"blockReason":"SAFETY"}}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(fixture)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key")
+	req := core.ChatRequest{RequestID: "req-4", Messages: []core.Message{{Role: "user", Content: "oi"}}}
+
+	_, err := client.Chat(context.Background(), "gemini-1.5-pro", req)
+	if err == nil {
+		t.Fatalf("expected an error for a blocked prompt")
+	}
+	var be *core.BackendError
+	if !errors.As(err, &be) {
+		t.Fatalf("expected a *core.BackendError, got %T: %v", err, err)
+	}
+	if be.Class != core.Permanent {
+		t.Fatalf("expected Permanent class, got %s", be.Class)
+	}
+	if be.Status != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", be.Status)
+	}
+	if !strings.Contains(be.Error(), "SAFETY") {
+		t.Fatalf("expected error message to mention SAFETY, got %q", be.Error())
+	}
+}
+
+func TestChatStream_PromptBlocked_ErrorsWithNoChunks(t *testing.T) {
+	fixture := []byte("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(fixture)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key")
+	req := core.ChatRequest{RequestID: "req-5", Messages: []core.Message{{Role: "user", Content: "oi"}}}
+
+	chunks, errs := client.ChatStream(context.Background(), "gemini-1.5-pro", req)
+
+	var gotChunks int
+	for range chunks {
+		gotChunks++
+	}
+	if gotChunks != 0 {
+		t.Fatalf("expected no chunks for a blocked prompt, got %d", gotChunks)
+	}
+
+	err := <-errs
+	if err == nil {
+		t.Fatalf("expected an error for a blocked prompt")
+	}
+	var be *core.BackendError
+	if !errors.As(err, &be) {
+		t.Fatalf("expected a *core.BackendError, got %T: %v", err, err)
+	}
+	if be.Class != core.Permanent {
+		t.Fatalf("expected Permanent class, got %s", be.Class)
+	}
+	if !strings.Contains(be.Error(), "SAFETY") {
+		t.Fatalf("expected error message to mention SAFETY, got %q", be.Error())
+	}
+}
+
+func TestToRequestBody_SystemMessageBecomesSystemInstruction(t *testing.T) {
+	messages := []core.Message{
+		{Role: "system", Content: "be concise"},
+		{Role: "user", Content: "oi"},
+		{Role: "assistant", Content: "olá"},
+	}
+	body := toRequestBody(messages)
+
+	if body.SystemInstruction == nil {
+		t.Fatalf("expected systemInstruction to be set")
+	}
+	if len(body.SystemInstruction.Parts) != 1 || body.SystemInstruction.Parts[0].Text != "be concise" {
+		t.Fatalf("unexpected systemInstruction: %+v", body.SystemInstruction)
+	}
+	for _, c := range body.Contents {
+		if c.Role == "system" {
+			t.Fatalf("contents must not carry role \"system\": %+v", body.Contents)
+		}
+	}
+	if len(body.Contents) != 2 {
+		t.Fatalf("expected 2 contents (user, model), got %d: %+v", len(body.Contents), body.Contents)
+	}
+	if body.Contents[0].Role != "user" || body.Contents[1].Role != "model" {
+		t.Fatalf("unexpected content roles: %+v", body.Contents)
+	}
+}
+
+func TestClassify_MapsStatusToErrorClass(t *testing.T) {
+	cases := []struct {
+		status int
+		want   core.ErrorClass
+	}{
+		{http.StatusBadRequest, core.Permanent},
+		{http.StatusUnauthorized, core.Permanent},
+		{http.StatusNotFound, core.Permanent},
+		{http.StatusTooManyRequests, core.Transient},
+		{http.StatusInternalServerError, core.Transient},
+		{http.StatusServiceUnavailable, core.Transient},
+	}
+	for _, tc := range cases {
+		if got := classify(tc.status); got != tc.want {
+			t.Errorf("classify(%d) = %s, want %s", tc.status, got, tc.want)
+		}
 	}
 }
