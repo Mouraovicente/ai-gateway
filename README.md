@@ -230,7 +230,12 @@ Error types (JSON body `{"error":{"type","message","request_id"}}`, plus HTTP st
 
 ## Performance
 
-Local benchmark against a stub Ollama backend (isolates gateway overhead from real model inference): full pipeline sustains only **~7 req/s** at concurrency 10-100, while the cheap auth-reject path alone does **~65 req/s**. That gap points at the real bottleneck — LocalStack's single-process DynamoDB/SQS emulation, not the gateway's own code, since throughput stays flat whether the backend answers instantly or with an artificial 200ms delay. Real AWS DynamoDB/SQS would very likely move this ceiling much higher. Full method, numbers and caveats: `docs/benchmarks/2026-09-20-local.md`. Reproduce with `bash bench/run.sh`.
+Local benchmark against a stub Ollama backend, after moving trace writes and usage publishing off the request path (`bench/run.sh`, two modes):
+
+- **`STORE_BACKEND=memory`** (gateway overhead alone, no AWS): **~15,200 req/s** at concurrency 50, p50 **2.6 ms**, p99 **11.5 ms**; **~7,500 req/s** streaming; the auth-reject path does **~62,700 req/s**. With a 200 ms backend the gateway adds ~1 ms on top — throughput is exactly `concurrency / backend latency`, i.e. the backend is the only limit left.
+- **LocalStack (DynamoDB + SQS)**: **~18 req/s** at concurrency 50 (p50 2.7 s), up from ~7 req/s, and concurrency 200 no longer collapses into timeouts (~21 req/s vs. total failure before).
+
+The old ~7 req/s ceiling was ~11 synchronous store round trips per request; it is now 2 (auth + budget reserve/settle), with traces and usage events batched onto bounded background queues. What is left in LocalStack mode is LocalStack's own single-process emulator, which the memory-mode numbers isolate away. Full method, before/after table and caveats: `docs/benchmarks/2026-09-20-local.md`. Reproduce with `bash bench/run.sh memory` and `bash bench/run.sh`.
 
 ## Deploy
 
