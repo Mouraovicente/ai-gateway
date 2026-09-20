@@ -11,6 +11,7 @@ import (
 
 type fakeBackend struct {
 	calls   int
+	onCall  func()
 	results []struct {
 		resp core.ChatResponse
 		err  error
@@ -20,6 +21,9 @@ type fakeBackend struct {
 func (f *fakeBackend) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
 	i := f.calls
 	f.calls++
+	if f.onCall != nil {
+		f.onCall()
+	}
 	if i >= len(f.results) {
 		i = len(f.results) - 1
 	}
@@ -214,5 +218,42 @@ func TestCall_CancelledDuringBackoff_ReturnsContextCanceled(t *testing.T) {
 	}
 	if elapsed > 100*time.Millisecond {
 		t.Fatalf("expected Call to return promptly after cancellation, took %v", elapsed)
+	}
+}
+
+func TestCall_ContextCancelledAfterFirstAttempt_StopsCascadeImmediately(t *testing.T) {
+	// Simulates: the client disconnects right as the first target's Chat
+	// call returns a transient error. The cascade must not start a second
+	// target's attempt just because the error looked retryable/transient.
+	ctx, cancel := context.WithCancel(context.Background())
+	ollama := &fakeBackend{results: []struct {
+		resp core.ChatResponse
+		err  error
+	}{
+		{err: &core.BackendError{Class: core.Transient, Err: errors.New("boom")}},
+	}}
+	ollama.onCall = cancel
+	openrouter := &fakeBackend{results: []struct {
+		resp core.ChatResponse
+		err  error
+	}{
+		{resp: core.ChatResponse{Message: core.Message{Content: "should never be reached"}}},
+	}}
+
+	backends := map[string]Backend{"ollama": ollama, "openrouter": openrouter}
+	targets := []core.BackendTarget{{Provider: "ollama", Model: "m1"}, {Provider: "openrouter", Model: "m2"}}
+
+	_, _, attempts, err := Call(ctx, backends, targets, core.ChatRequest{})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected wrapped context.Canceled, got %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected exactly one attempt before stopping, got %d: %+v", len(attempts), attempts)
+	}
+	if openrouter.calls != 0 {
+		t.Fatalf("expected the second target to never be called, got %d calls", openrouter.calls)
 	}
 }

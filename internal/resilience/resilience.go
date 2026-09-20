@@ -83,6 +83,13 @@ func Call(ctx context.Context, backends map[string]Backend, targets []core.Backe
 			}
 			attempts = append(attempts, Attempt{Provider: target.Provider, Model: target.Model, Status: status, Err: err, StartedAt: startedAt, LatencyMs: latencyMs})
 
+			if ctx.Err() != nil {
+				// The caller is already gone (or its deadline passed): never
+				// start another target's attempt, just report the
+				// cancellation with the attempts made so far.
+				return core.ChatResponse{}, core.BackendTarget{}, attempts, fmt.Errorf("resilience: cancelled: %w", ctx.Err())
+			}
+
 			if !errors.As(err, &be) || !be.IsTransient() {
 				break // permanent error: stop retrying this backend, move to next target
 			}
@@ -150,6 +157,12 @@ func CallStream(ctx context.Context, targets []core.BackendTarget, resolve func(
 
 			if firstByteSent {
 				return usage, attempts, fmt.Errorf("%w: %v", ErrStreamFailedAfterFirstByte, streamErr)
+			}
+
+			if ctx.Err() != nil {
+				// Same rule as Call: a cancelled/expired context before the
+				// first byte means stop entirely, never start the next target.
+				return usage, attempts, fmt.Errorf("resilience: cancelled: %w", ctx.Err())
 			}
 
 			if !errors.As(streamErr, &be) || !be.IsTransient() {
