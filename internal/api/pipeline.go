@@ -314,7 +314,15 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 					logger.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
 					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "failed"})
 				} else {
-					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "ok"})
+					// An async publisher only accepted the event into its
+					// queue; claiming "ok" here would assert a delivery
+					// nobody has confirmed yet. The worker logs the real
+					// outcome with the request id.
+					publishStatus := "ok"
+					if _, async := p.Usage.(interface{ QueueDepth() int64 }); async {
+						publishStatus = "queued"
+					}
+					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": publishStatus})
 				}
 			}
 			if p.Stats != nil && status == "ok" {

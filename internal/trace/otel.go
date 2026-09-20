@@ -118,3 +118,41 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	}
 	return &Metrics{RequestsTotal: requestsTotal, LatencyMs: latencyMs, TokensTotal: tokensTotal, TTFTMs: ttftMs}, nil
 }
+
+// QueueInstruments are the async-queue instruments:
+//   - gateway_trace_queue_depth / gateway_usage_queue_depth (observable gauges)
+//   - gateway_trace_dropped_total / gateway_usage_dropped_total (counters)
+//
+// The gauges are observed from the supplied closures, so the queues stay
+// plain structs with no metric wiring inside them.
+type QueueInstruments struct {
+	TraceDropped metric.Int64Counter
+	UsageDropped metric.Int64Counter
+}
+
+// NewQueueInstruments registers the drop counters and the two depth gauges.
+func NewQueueInstruments(meter metric.Meter, traceDepth, usageDepth func() int64) (*QueueInstruments, error) {
+	traceDropped, err := meter.Int64Counter("gateway_trace_dropped_total")
+	if err != nil {
+		return nil, fmt.Errorf("trace: creating gateway_trace_dropped_total counter: %w", err)
+	}
+	usageDropped, err := meter.Int64Counter("gateway_usage_dropped_total")
+	if err != nil {
+		return nil, fmt.Errorf("trace: creating gateway_usage_dropped_total counter: %w", err)
+	}
+	if _, err := meter.Int64ObservableGauge("gateway_trace_queue_depth",
+		metric.WithInt64Callback(func(ctx context.Context, o metric.Int64Observer) error {
+			o.Observe(traceDepth())
+			return nil
+		})); err != nil {
+		return nil, fmt.Errorf("trace: creating gateway_trace_queue_depth gauge: %w", err)
+	}
+	if _, err := meter.Int64ObservableGauge("gateway_usage_queue_depth",
+		metric.WithInt64Callback(func(ctx context.Context, o metric.Int64Observer) error {
+			o.Observe(usageDepth())
+			return nil
+		})); err != nil {
+		return nil, fmt.Errorf("trace: creating gateway_usage_queue_depth gauge: %w", err)
+	}
+	return &QueueInstruments{TraceDropped: traceDropped, UsageDropped: usageDropped}, nil
+}

@@ -158,6 +158,39 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Trace and usage writes leave the request path here: the pipeline still
+	// calls RecordRequest/RecordEvent/Publish, but those now enqueue and
+	// return instead of doing ~9 DynamoDB round trips plus one SQS publish
+	// inline. Both queues are bounded and drop (counted, logged, never
+	// blocking) rather than add latency under pressure.
+	var asyncTrace *trace.AsyncStore
+	var asyncUsage *usage.AsyncPublisher
+	queueInstruments, err := trace.NewQueueInstruments(meter,
+		func() int64 {
+			if asyncTrace == nil {
+				return 0
+			}
+			return asyncTrace.QueueDepth()
+		},
+		func() int64 {
+			if asyncUsage == nil {
+				return 0
+			}
+			return asyncUsage.QueueDepth()
+		})
+	if err != nil {
+		logger.Error("registering queue metrics", "error", err)
+		os.Exit(1)
+	}
+	asyncTrace = trace.NewAsyncStore(
+		trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events")),
+		atoiDefault(os.Getenv("TRACE_QUEUE_SIZE"), trace.DefaultTraceQueueSize),
+		logger, &trace.AsyncQueueMetrics{Dropped: queueInstruments.TraceDropped})
+	asyncUsage = usage.NewAsyncPublisher(
+		usage.NewSQSPublisher(sqsClient, usageQueueURL),
+		atoiDefault(os.Getenv("USAGE_QUEUE_SIZE"), usage.DefaultQueueSize),
+		logger, queueInstruments.UsageDropped)
+
 	// One IP limiter shared by the chat pipeline and /stats: both hit the
 	// same tenant store, so they must share the same pre-auth budget.
 	ipLimiter := ratelimit.NewIPLimiter(atoiDefault(os.Getenv("IP_AUTH_FAILURES_PER_MINUTE"), ratelimit.DefaultIPFailuresPerMinute))
@@ -169,8 +202,8 @@ func main() {
 		Budget:    budget.NewDynamoStore(dynamoClient, getenv("BUDGETS_TABLE", "budgets"), getenv("RESERVATIONS_TABLE", "reservations")),
 		Routing:   routing,
 		Backends:  backends,
-		Trace:     trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events")),
-		Usage:     usage.NewSQSPublisher(sqsClient, usageQueueURL),
+		Trace:     asyncTrace,
+		Usage:     asyncUsage,
 		Stats:     statsRecorder,
 		Tracer:    trace.Tracer(),
 		Metrics:   metrics,
@@ -299,6 +332,16 @@ func main() {
 		if err := server.Shutdown(timeoutCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
+		// Only once in-flight requests are done: drain the async queues, so
+		// the last requests' trace and usage events are not lost.
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := asyncTrace.Close(drainCtx); err != nil {
+			logger.Error("trace queue drain failed", "error", err)
+		}
+		if err := asyncUsage.Close(drainCtx); err != nil {
+			logger.Error("usage queue drain failed", "error", err)
+		}
+		cancelDrain()
 		// Independent 5s timeouts: a stuck trace exporter must not delay (or
 		// get short-changed by) the metrics provider's own shutdown, and
 		// vice versa.

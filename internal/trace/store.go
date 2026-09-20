@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // EventType classifies a trace_event, matching the pipeline stage that emitted it.
@@ -86,15 +87,18 @@ type eventItem struct {
 	Payload   string `dynamodbav:"payload_json"`
 }
 
-func (s *dynamoStore) RecordEvent(ctx context.Context, requestID string, seq int, eventType EventType, node string, payload map[string]any) error {
+// eventItem validates and marshals one trace_event into its DynamoDB item:
+// forbidden keys are rejected outright, and an oversized payload is
+// replaced with a truncation marker rather than failing the write.
+func (s *dynamoStore) eventItem(requestID string, seq int, eventType EventType, node string, payload map[string]any) (map[string]types.AttributeValue, error) {
 	for key := range payload {
 		if isForbidden(key) {
-			return fmt.Errorf("trace: payload contains forbidden key %q", key)
+			return nil, fmt.Errorf("trace: payload contains forbidden key %q", key)
 		}
 	}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("trace: marshaling event payload: %w", err)
+		return nil, fmt.Errorf("trace: marshaling event payload: %w", err)
 	}
 	if len(payloadJSON) > MaxPayloadBytes {
 		payloadJSON, err = json.Marshal(map[string]any{
@@ -102,7 +106,7 @@ func (s *dynamoStore) RecordEvent(ctx context.Context, requestID string, seq int
 			"original_bytes": len(payloadJSON),
 		})
 		if err != nil {
-			return fmt.Errorf("trace: marshaling truncated payload marker: %w", err)
+			return nil, fmt.Errorf("trace: marshaling truncated payload marker: %w", err)
 		}
 	}
 	item, err := attributevalue.MarshalMap(eventItem{
@@ -113,10 +117,17 @@ func (s *dynamoStore) RecordEvent(ctx context.Context, requestID string, seq int
 		Payload:   string(payloadJSON),
 	})
 	if err != nil {
-		return fmt.Errorf("trace: marshaling event item: %w", err)
+		return nil, fmt.Errorf("trace: marshaling event item: %w", err)
 	}
-	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.eventsTable, Item: item})
+	return item, nil
+}
+
+func (s *dynamoStore) RecordEvent(ctx context.Context, requestID string, seq int, eventType EventType, node string, payload map[string]any) error {
+	item, err := s.eventItem(requestID, seq, eventType, node, payload)
 	if err != nil {
+		return err
+	}
+	if _, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.eventsTable, Item: item}); err != nil {
 		return fmt.Errorf("trace: writing event item: %w", err)
 	}
 	return nil
