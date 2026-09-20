@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -45,6 +46,7 @@ func getenv(key, def string) string {
 
 func main() {
 	logger := trace.NewLogger(os.Stdout)
+	slog.SetDefault(logger)
 	ctx := context.Background()
 
 	routingPath := getenv("ROUTING_CONFIG", "config/routing.yaml")
@@ -157,6 +159,7 @@ func main() {
 		Stats:     statsRecorder,
 		Tracer:    trace.Tracer(),
 		Metrics:   metrics,
+		Logger:    logger,
 	}
 
 	tenantsTable := getenv("TENANTS_TABLE", "tenants")

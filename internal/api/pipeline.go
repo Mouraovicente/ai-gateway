@@ -48,6 +48,13 @@ type Pipeline struct {
 	// nil, so OTel stays fully optional.
 	Tracer  oteltrace.Tracer
 	Metrics *trace.Metrics
+	// Logger receives every internal (non-caller-facing) log line this
+	// pipeline emits. Defaults to slog.Default() so pre-Task-13-style tests
+	// that never set it keep working, but production wiring (main.go) sets
+	// it to the same *slog.Logger passed to slog.SetDefault, so trace store
+	// failures etc. go through the structured, redacted logger instead of
+	// slog's bare default (which never applied trace.NewLogger's redaction).
+	Logger *slog.Logger
 }
 
 // NewPipelineChatHandler is the real handler for POST /v1/chat/completions:
@@ -60,6 +67,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 	tracer := p.Tracer
 	if tracer == nil {
 		tracer = noop.NewTracerProvider().Tracer("ai-gateway")
+	}
+	logger := p.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -87,7 +98,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit := func(eventType trace.EventType, node string, payload map[string]any) {
 			seq++
 			if err := p.Trace.RecordEvent(traceCtx, requestID, seq, eventType, node, payload); err != nil {
-				slog.Error("trace: failed to record event", "request_id", requestID, "seq", seq, "type", string(eventType), "error", err.Error())
+				logger.Error("trace: failed to record event", "request_id", requestID, "seq", seq, "type", string(eventType), "error", err.Error())
 			}
 		}
 		// writeErr is the single write path for every error response below,
@@ -144,6 +155,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			writeErr(http.StatusBadRequest, "invalid_request", "model must not be empty")
 			return
 		}
+		maxTokens := 0
+		if body.MaxTokens != nil {
+			if *body.MaxTokens <= 0 || *body.MaxTokens > 32768 {
+				writeErr(http.StatusBadRequest, "invalid_request", "max_tokens must be between 1 and 32768")
+				return
+			}
+			maxTokens = *body.MaxTokens
+		}
 
 		messages := make([]core.Message, 0, len(body.Messages))
 		promptBytes := 0
@@ -151,11 +170,11 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			messages = append(messages, core.Message{Role: m.Role, Content: m.Content})
 			promptBytes += len(m.Content)
 		}
-		chatReq := core.ChatRequest{RequestID: requestID, TenantID: tenant.ID, Alias: body.Model, Tier: tenant.Tier, Messages: messages, Stream: body.Stream}
+		chatReq := core.ChatRequest{RequestID: requestID, TenantID: tenant.ID, Alias: body.Model, Tier: tenant.Tier, Messages: messages, MaxTokens: maxTokens, Stream: body.Stream}
 		requestSpan.SetAttributes(otelattr.String("alias", body.Model))
 
 		period := time.Now().UTC().Format("2006-01")
-		estimated := budget.EstimateTokens(promptBytes, 0)
+		estimated := budget.EstimateTokens(promptBytes, maxTokens)
 		reserveCtx, reserveSpan := tracer.Start(ctx, "budget.reserve")
 		reservation, err := p.Budget.Reserve(reserveCtx, tenant.ID, period, estimated, tenant.MonthlyTokenBudget)
 		reserveSpan.End()
@@ -171,7 +190,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "reservation_id": reservation.ID, "estimated_tokens": estimated})
 
 		if err := p.Trace.RecordRequest(traceCtx, requestID, tenant.ID, body.Model); err != nil {
-			slog.Error("trace: failed to record request", "request_id", requestID, "error", err.Error())
+			logger.Error("trace: failed to record request", "request_id", requestID, "error", err.Error())
 		}
 
 		// respUsage is settled in this defer on every exit path (success,
@@ -193,7 +212,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			realTokens := respUsage.PromptTokens + respUsage.CompletionTokens
 			_, settleSpan := tracer.Start(traceCtx, "budget.settle")
 			if err := p.Budget.Settle(traceCtx, reservation, realTokens); err != nil {
-				slog.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
+				logger.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
 			}
 			settleSpan.End()
 			emit(trace.BudgetSettle, "budget", map[string]any{"tenant_id": tenant.ID, "real_tokens": realTokens})
@@ -234,7 +253,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				publishSpan.End()
 				cancelPublish()
 				if err != nil {
-					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
+					logger.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
 					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "failed"})
 				} else {
 					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID, "status": "ok"})

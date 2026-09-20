@@ -17,10 +17,15 @@ type incomingMessage struct {
 }
 
 type chatCompletionRequest struct {
-	Model    string            `json:"model"`
-	Messages []incomingMessage `json:"messages"`
-	Stream   bool              `json:"stream"`
+	Model     string            `json:"model"`
+	Messages  []incomingMessage `json:"messages"`
+	Stream    bool              `json:"stream"`
+	MaxTokens *int              `json:"max_tokens"`
 }
+
+// maxTokensLimit is the largest max_tokens value the gateway accepts; above
+// this, the request is rejected outright rather than forwarded to a backend.
+const maxTokensLimit = 32768
 
 // NewChatHandler is the Task 5 bootstrap handler: it always calls the given
 // fixed Ollama model, with no auth/ratelimit/budget/routing. The full

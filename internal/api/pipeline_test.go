@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -703,5 +704,144 @@ func TestPipeline_UsagePublishTimeout_EmitsFailedTraceEvent(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a usage_publish trace event even on timeout, got %v", tr.types())
+	}
+}
+
+// failingRequestTrace fails RecordRequest (but not RecordEvent), forcing the
+// pipeline's error-logging path to run.
+type failingRequestTrace struct{}
+
+func (f *failingRequestTrace) RecordRequest(ctx context.Context, requestID, tenantID, alias string) error {
+	return errors.New("trace store unavailable")
+}
+func (f *failingRequestTrace) RecordEvent(ctx context.Context, requestID string, seq int, eventType trace.EventType, node string, payload map[string]any) error {
+	return nil
+}
+
+func TestPipeline_TraceStoreFailure_LogsWithoutForbiddenKeys(t *testing.T) {
+	var buf bytes.Buffer
+	logger := trace.NewLogger(&buf)
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free", RPMLimit: 10, MonthlyTokenBudget: 100000}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeChatBackend{content: "ok"}},
+		Trace:     &failingRequestTrace{},
+		Logger:    logger,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	reqBody := `{"model":"nuva/fast","messages":[{"role":"user","content":"super secret prompt"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "trace: failed to record request") {
+		t.Fatalf("expected the trace store failure to be logged, got: %s", logOutput)
+	}
+	for _, key := range trace.ForbiddenKeys {
+		if strings.Contains(strings.ToLower(logOutput), `"`+strings.ToLower(key)+`"`) {
+			t.Fatalf("log line must never contain forbidden key %q: %s", key, logOutput)
+		}
+	}
+	if strings.Contains(logOutput, "super secret prompt") {
+		t.Fatalf("log line must never contain request content: %s", logOutput)
+	}
+}
+
+// recordingChatBackend behaves like fakeChatBackend but captures the last
+// core.ChatRequest it received, so tests can assert what the pipeline
+// forwards downstream (e.g. MaxTokens).
+type recordingChatBackend struct {
+	content string
+	lastReq core.ChatRequest
+}
+
+func (f *recordingChatBackend) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
+	f.lastReq = req
+	return core.ChatResponse{Message: core.Message{Role: "assistant", Content: f.content}, Usage: core.Usage{PromptTokens: 5, CompletionTokens: 3}, FinishReason: "stop"}, nil
+}
+
+func (f *recordingChatBackend) ChatStream(ctx context.Context, model string, req core.ChatRequest) (<-chan core.ChatChunk, <-chan error) {
+	chunks := make(chan core.ChatChunk)
+	errs := make(chan error, 1)
+	close(chunks)
+	close(errs)
+	return chunks, errs
+}
+
+func TestPipeline_MaxTokens_ForwardedAndUsedInEstimate(t *testing.T) {
+	backend := &recordingChatBackend{content: "ok"}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free", RPMLimit: 10, MonthlyTokenBudget: 100000}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": backend},
+		Trace:     &fakeTrace{},
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	reqBody := `{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}],"max_tokens":256}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if backend.lastReq.MaxTokens != 256 {
+		t.Fatalf("expected max_tokens 256 forwarded to backend, got %d", backend.lastReq.MaxTokens)
+	}
+}
+
+func TestPipeline_MaxTokens_ZeroOrNegative_Returns400(t *testing.T) {
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free", RPMLimit: 10, MonthlyTokenBudget: 100000}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeChatBackend{content: "ok"}},
+		Trace:     &fakeTrace{},
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	reqBody := `{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}],"max_tokens":0}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for max_tokens 0, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPipeline_MaxTokens_AboveLimit_Returns400(t *testing.T) {
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free", RPMLimit: 10, MonthlyTokenBudget: 100000}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    &fakeBudget{},
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": &fakeChatBackend{content: "ok"}},
+		Trace:     &fakeTrace{},
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	reqBody := `{"model":"nuva/fast","messages":[{"role":"user","content":"oi"}],"max_tokens":40000}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for max_tokens over limit, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
