@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -35,6 +35,16 @@ import (
 
 // strPtr returns a pointer to s, for AWS SDK request fields that take *string.
 func strPtr(s string) *string { return &s }
+
+// atoiDefault parses s as an int, falling back to def when it is unset or
+// not a positive number.
+func atoiDefault(s string, def int) int {
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
 
 // getenv returns the environment variable named by key, or def if it is unset or empty.
 func getenv(key, def string) string {
@@ -148,7 +158,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One IP limiter shared by the chat pipeline and /stats: both hit the
+	// same tenant store, so they must share the same pre-auth budget.
+	ipLimiter := ratelimit.NewIPLimiter(atoiDefault(os.Getenv("IP_AUTH_FAILURES_PER_MINUTE"), ratelimit.DefaultIPFailuresPerMinute))
+
 	pipeline := &api.Pipeline{
+		IPLimit:   ipLimiter,
 		Auth:      authStore,
 		RateLimit: ratelimit.NewInMemoryLimiter(),
 		Budget:    budget.NewDynamoStore(dynamoClient, getenv("BUDGETS_TABLE", "budgets"), getenv("RESERVATIONS_TABLE", "reservations")),
@@ -213,36 +228,73 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
-		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if apiKey == "" {
+		w.Header().Set("Content-Type", "application/json")
+		// Same pre-auth guard as the chat path: /stats hits the same tenant
+		// store, so it is the same free brute-force oracle if left open.
+		clientIP := api.ClientIP(r)
+		if !ipLimiter.Allowed(clientIP) {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"type":"rate_limited"}}`))
+			return
+		}
+		apiKey, ok := api.ParseBearer(r.Header.Get("Authorization"))
+		if !ok {
+			ipLimiter.RecordFailure(clientIP)
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"error":{"type":"missing_api_key"}}`))
 			return
 		}
 		tenant, err := authStore.ResolveAPIKey(r.Context(), apiKey)
 		if err != nil {
+			if !errors.Is(err, auth.ErrUnknownAPIKey) {
+				logger.Error("auth: tenant store unavailable", "route", "/stats", "error", err.Error())
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"error":{"type":"store_unavailable"}}`))
+				return
+			}
+			ipLimiter.RecordFailure(clientIP)
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"error":{"type":"invalid_api_key"}}`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(statsRecorder.Snapshot(tenant.ID))
 	})
 
 	mux.Handle("POST /v1/chat/completions", api.NewPipelineChatHandler(pipeline))
 
-	handler := api.RequestIDMiddleware(mux)
+	handler := api.SecurityHeadersMiddleware(api.RequestIDMiddleware(mux))
 
 	addr := getenv("GATEWAY_ADDR", ":8080")
-	server := &http.Server{Addr: addr, Handler: handler}
+	// No WriteTimeout on purpose: it would cut legitimate long SSE streams.
+	// The slow-client cut comes from the per-chunk write deadline in the
+	// pipeline instead (api.Pipeline.StreamWriteTimeout).
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// serveErr carries a real listen failure out of the goroutine;
+	// shutdownDone is what main blocks on, so the process does not exit the
+	// instant ListenAndServe returns ErrServerClosed (which happens as soon
+	// as Shutdown *starts*, aborting in-flight streams and skipping every
+	// flush below).
+	serveErr := make(chan error, 1)
+	shutdownDone := make(chan struct{})
+
 	go func() {
+		defer close(shutdownDone)
 		<-shutdownCtx.Done()
 		logger.Info("shutting down ai-gateway")
-		timeoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := server.Shutdown(timeoutCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
@@ -267,8 +319,21 @@ func main() {
 	}()
 
 	logger.Info("starting ai-gateway", "addr", addr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	if err := <-serveErr; err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+	// ListenAndServe returned ErrServerClosed: wait for the shutdown
+	// sequence (in-flight requests, queue drains, exporter flushes) to
+	// actually finish before the process exits.
+	<-shutdownDone
+	logger.Info("ai-gateway stopped")
 }

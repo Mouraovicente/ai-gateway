@@ -6,11 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/Mouraovicente/ai-gateway/internal/core"
+	"github.com/Mouraovicente/ai-gateway/internal/httpx"
 )
 
 // Client talks to OpenRouter's OpenAI-compatible /v1/chat/completions endpoint.
@@ -21,7 +21,7 @@ type Client struct {
 }
 
 func NewClient(baseURL, apiKey string) *Client {
-	return &Client{baseURL: baseURL, apiKey: apiKey, http: &http.Client{}}
+	return &Client{baseURL: baseURL, apiKey: apiKey, http: httpx.NewClient()}
 }
 
 type streamOptions struct {
@@ -61,6 +61,10 @@ func classify(status int) core.ErrorClass {
 
 // Chat performs a single non-streaming call to OpenRouter.
 func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (core.ChatResponse, error) {
+	// Total budget for one non-streaming attempt; the streaming path relies
+	// on the transport's ResponseHeaderTimeout plus the request context instead.
+	ctx, cancel := context.WithTimeout(ctx, httpx.NonStreamTimeout)
+	defer cancel()
 	body, err := json.Marshal(requestBody{Model: model, Messages: req.Messages, Stream: false, MaxTokens: req.MaxTokens})
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Permanent, Err: fmt.Errorf("openrouter: marshaling request: %w", err)}
@@ -81,7 +85,7 @@ func (c *Client) Chat(ctx context.Context, model string, req core.ChatRequest) (
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := httpx.ReadAllLimited(resp.Body)
 	if err != nil {
 		return core.ChatResponse{}, &core.BackendError{Class: core.Transient, Err: fmt.Errorf("openrouter: reading response: %w", err)}
 	}
@@ -142,12 +146,13 @@ func (c *Client) ChatStream(ctx context.Context, model string, req core.ChatRequ
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(resp.Body)
+			raw, _ := httpx.ReadAllLimited(resp.Body)
 			errs <- &core.BackendError{Class: classify(resp.StatusCode), Status: resp.StatusCode, Err: fmt.Errorf("openrouter: %s", string(raw))}
 			return
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64<<10), httpx.MaxStreamLineBytes)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || !strings.HasPrefix(line, "data: ") {

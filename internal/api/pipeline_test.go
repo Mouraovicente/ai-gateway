@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mouraovicente/ai-gateway/internal/auth"
 	"github.com/Mouraovicente/ai-gateway/internal/budget"
 	"github.com/Mouraovicente/ai-gateway/internal/config"
 	"github.com/Mouraovicente/ai-gateway/internal/core"
@@ -75,7 +76,7 @@ type fakeAuth struct{ tenant core.Tenant }
 
 func (f *fakeAuth) ResolveAPIKey(ctx context.Context, apiKey string) (core.Tenant, error) {
 	if apiKey != "valid-key" {
-		return core.Tenant{}, context.DeadlineExceeded // any non-nil error signals "not found" for this fake
+		return core.Tenant{}, auth.ErrUnknownAPIKey
 	}
 	return f.tenant, nil
 }

@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Mouraovicente/ai-gateway/internal/auth"
@@ -55,7 +54,28 @@ type Pipeline struct {
 	// failures etc. go through the structured, redacted logger instead of
 	// slog's bare default (which never applied trace.NewLogger's redaction).
 	Logger *slog.Logger
+	// IPLimit is the pre-auth guard (see ratelimit.IPLimiter): consulted
+	// before ResolveAPIKey, charged only on authentication failures. nil
+	// disables it (the default in tests).
+	IPLimit *ratelimit.IPLimiter
+	// StreamWriteTimeout bounds a single SSE write, so a client that opens
+	// a stream and then stops reading cannot pin the handler goroutine (and
+	// the paid upstream connection behind it) forever. 0 means
+	// defaultStreamWriteTimeout.
+	StreamWriteTimeout time.Duration
 }
+
+// defaultStreamWriteTimeout is the per-chunk SSE write deadline. Per chunk,
+// never a server-wide WriteTimeout: a long legitimate stream must survive.
+const defaultStreamWriteTimeout = 30 * time.Second
+
+// maxMessages and maxPromptBytes bound the decoded body beyond the 1 MiB
+// wire limit: tens of thousands of tiny messages fit inside 1 MiB and each
+// one becomes a core.Message that is re-serialized upstream.
+const (
+	maxMessages    = 64
+	maxPromptBytes = 256 << 10
+)
 
 // NewPipelineChatHandler is the real handler for POST /v1/chat/completions:
 // auth -> ratelimit -> budget.Reserve -> router.Resolve -> resilience.Call/CallStream -> budget.Settle,
@@ -71,6 +91,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 	logger := p.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	streamWriteTimeout := p.StreamWriteTimeout
+	if streamWriteTimeout <= 0 {
+		streamWriteTimeout = defaultStreamWriteTimeout
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -109,18 +133,44 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			WriteError(w, requestID, status, code, msg)
 		}
 
-		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if apiKey == "" {
+		clientIP := ClientIP(r)
+		// Pre-auth: an IP that already burned its failure budget is
+		// rejected here, before any store lookup happens on its behalf.
+		if p.IPLimit != nil && !p.IPLimit.Allowed(clientIP) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(http.StatusTooManyRequests, "rate_limited", "too many failed authentication attempts")
+			return
+		}
+		denyAuth := func(code, msg string) {
+			if p.IPLimit != nil {
+				p.IPLimit.RecordFailure(clientIP)
+			}
+			writeErr(http.StatusUnauthorized, code, msg)
+		}
+
+		apiKey, keyOK := ParseBearer(r.Header.Get("Authorization"))
+		if !keyOK {
 			emit(trace.Auth, "auth", map[string]any{"status": "denied", "reason": "missing_header"})
-			writeErr(http.StatusUnauthorized, "missing_api_key", "missing Authorization header")
+			denyAuth("missing_api_key", "missing or malformed Authorization header")
 			return
 		}
 		authCtx, authSpan := tracer.Start(ctx, "auth")
 		tenant, err := p.Auth.ResolveAPIKey(authCtx, apiKey)
 		authSpan.End()
 		if err != nil {
+			// A store outage is not a credential problem: answering every
+			// caller "your key is invalid" during a DynamoDB throttle is
+			// both the wrong instruction to the client and the wrong
+			// diagnosis for whoever is on call.
+			if !errors.Is(err, auth.ErrUnknownAPIKey) {
+				logger.Error("auth: tenant store unavailable", "request_id", requestID, "error", err.Error())
+				emit(trace.Auth, "auth", map[string]any{"status": "error", "reason": "store_unavailable"})
+				w.Header().Set("Retry-After", "1")
+				writeErr(http.StatusServiceUnavailable, "store_unavailable", "tenant store temporarily unavailable")
+				return
+			}
 			emit(trace.Auth, "auth", map[string]any{"status": "denied"})
-			writeErr(http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+			denyAuth("invalid_api_key", "invalid API key")
 			return
 		}
 		emit(trace.Auth, "auth", map[string]any{"tenant_id": tenant.ID, "tier": tenant.Tier})
@@ -155,6 +205,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			writeErr(http.StatusBadRequest, "invalid_request", "model must not be empty")
 			return
 		}
+		if len(body.Messages) > maxMessages {
+			writeErr(http.StatusRequestEntityTooLarge, "invalid_request", "too many messages")
+			return
+		}
 		maxTokens := 0
 		if body.MaxTokens != nil {
 			if *body.MaxTokens <= 0 || *body.MaxTokens > maxTokensLimit {
@@ -169,6 +223,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		for _, m := range body.Messages {
 			messages = append(messages, core.Message{Role: m.Role, Content: m.Content})
 			promptBytes += len(m.Content)
+		}
+		if promptBytes > maxPromptBytes {
+			writeErr(http.StatusRequestEntityTooLarge, "invalid_request", "prompt too large")
+			return
 		}
 		chatReq := core.ChatRequest{RequestID: requestID, TenantID: tenant.ID, Alias: body.Model, Tier: tenant.Tier, Messages: messages, MaxTokens: maxTokens, Stream: body.Stream}
 		requestSpan.SetAttributes(otelattr.String("alias", body.Model))
@@ -282,7 +340,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				targets: targets, chatReq: chatReq, requestID: requestID,
 				usage: &respUsage, outTarget: &target, outAttempts: &attempts, outTTFTMs: &ttftMs,
 				outStatus: &status, outErrorClass: &errorClass, outHTTPStatus: &httpStatus,
-				start: start, emit: emit,
+				start: start, emit: emit, writeTimeout: streamWriteTimeout,
 			})
 			return
 		}
@@ -458,8 +516,9 @@ type streamArgs struct {
 	targets   []core.BackendTarget
 	chatReq   core.ChatRequest
 	requestID string
-	start     time.Time
-	emit      func(trace.EventType, string, map[string]any)
+	start        time.Time
+	emit         func(trace.EventType, string, map[string]any)
+	writeTimeout time.Duration
 
 	usage         *core.Usage
 	outTarget     *core.BackendTarget
@@ -509,6 +568,22 @@ func serveStreamPipeline(args streamArgs) {
 		return backend, nil
 	}
 
+	// rc drives the per-write deadline. On the real net/http writer this
+	// sets a socket deadline; on a writer that does not support one
+	// (httptest.ResponseRecorder) it reports ErrNotSupported and the write
+	// proceeds undeadlined.
+	rc := http.NewResponseController(w)
+	writeSSE := func(format string, a ...any) error {
+		if err := rc.SetWriteDeadline(time.Now().Add(args.writeTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, format, a...); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
 	streamStart := time.Now()
 	var ttfb time.Duration
 	ttfbSet := false
@@ -527,9 +602,10 @@ func serveStreamPipeline(args streamArgs) {
 			"object":  "chat.completion.chunk",
 			"choices": []map[string]any{{"index": 0, "delta": map[string]string{"content": chunk.Delta}, "finish_reason": chunk.FinishReason}},
 		})
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
-		return nil
+		// A write that blocks past the deadline (client stopped reading)
+		// surfaces here as an error and ends the stream, exactly like a
+		// disconnect would — never an indefinitely pinned goroutine.
+		return writeSSE("data: %s\n\n", payload)
 	}
 
 	result, attempts, streamErr := resilience.CallStream(args.ctx, args.targets, resolve, args.chatReq, onChunk)
@@ -597,10 +673,8 @@ func serveStreamPipeline(args streamArgs) {
 		oteltrace.SpanFromContext(args.ctx).SetAttributes(otelattr.String("error.class", *args.outErrorClass))
 		args.emit(trace.Error, "resilience", map[string]any{"reason": reason})
 		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": scrubErrorText(streamErr), "request_id": requestID}})
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
+		_ = writeSSE("data: %s\n\n", payload)
 	}
 
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	_ = writeSSE("data: [DONE]\n\n")
 }
