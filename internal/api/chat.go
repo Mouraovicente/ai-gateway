@@ -26,6 +26,11 @@ type chatCompletionRequest struct {
 // fixed Ollama model, with no auth/ratelimit/budget/routing. The full
 // pipeline (auth -> ratelimit -> budget -> router -> resilience) replaces
 // the target selection in Task 9, reusing this same HTTP translation layer.
+//
+// As of Task 11, NewPipelineChatHandler (pipeline.go) is the real handler
+// registered in cmd/gateway/main.go; this one is kept only for its own tests
+// and as the minimal reference implementation the pipeline's HTTP layer was
+// grown from.
 func NewChatHandler(client *ollama.Client, model string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := RequestIDFromContext(r.Context())
