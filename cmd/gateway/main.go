@@ -59,20 +59,33 @@ func main() {
 	// registered. Resolving to an unregistered provider surfaces later as an
 	// ordinary resilience "no backend registered" attempt, not a boot-time
 	// failure — so a gateway missing one API key can still serve the others.
+	// The env var holding a provider's key comes from routing.yaml
+	// (Provider.APIKeyEnv), never a name hardcoded here: adding a new
+	// provider to routing.yaml is enough, no code change needed to pick up
+	// its key. Ollama needs no key, only a reachable base URL.
 	backends := map[string]resilience.FullBackend{}
-	if ollamaBaseURL := os.Getenv("OLLAMA_BASE_URL"); ollamaBaseURL != "" {
-		backends["ollama"] = ollama.NewClient(ollamaBaseURL)
-	} else if p, ok := routing.Providers["ollama"]; ok && p.BaseURL != "" {
-		backends["ollama"] = ollama.NewClient(p.BaseURL)
+	registered := make([]string, 0, len(routing.Providers))
+
+	if p, ok := routing.Providers["ollama"]; ok {
+		baseURL := getenv("OLLAMA_BASE_URL", p.BaseURL)
+		if baseURL != "" {
+			backends["ollama"] = ollama.NewClient(baseURL)
+			registered = append(registered, "ollama")
+		}
 	}
-	if key := os.Getenv("OPENROUTER_API_KEY"); key != "" {
-		p := routing.Providers["openrouter"]
-		backends["openrouter"] = openrouter.NewClient(p.BaseURL, key)
+	if p, ok := routing.Providers["openrouter"]; ok && p.APIKeyEnv != "" {
+		if key := os.Getenv(p.APIKeyEnv); key != "" {
+			backends["openrouter"] = openrouter.NewClient(p.BaseURL, key)
+			registered = append(registered, "openrouter")
+		}
 	}
-	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
-		p := routing.Providers["gemini"]
-		backends["gemini"] = gemini.NewClient(p.BaseURL, key)
+	if p, ok := routing.Providers["gemini"]; ok && p.APIKeyEnv != "" {
+		if key := os.Getenv(p.APIKeyEnv); key != "" {
+			backends["gemini"] = gemini.NewClient(p.BaseURL, key)
+			registered = append(registered, "gemini")
+		}
 	}
+	logger.Info("registered backend providers", "providers", registered)
 
 	pipeline := &api.Pipeline{
 		Auth:      auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants")),

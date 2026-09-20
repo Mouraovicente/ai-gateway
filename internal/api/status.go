@@ -4,10 +4,34 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
 	"github.com/Mouraovicente/ai-gateway/internal/router"
 )
+
+// maxErrorTextBytes bounds any upstream error text placed in a response body
+// or SSE event. errorTextCap also cuts at the first newline, since an
+// upstream body that echoes request/prompt content back in an error message
+// would otherwise leak it verbatim into a client-visible field.
+const maxErrorTextBytes = 200
+
+// scrubErrorText returns err's message, truncated to the first line and to
+// maxErrorTextBytes, so an upstream error body can never smuggle arbitrary
+// multi-line content (or excessive length) into a client-facing error field.
+func scrubErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > maxErrorTextBytes {
+		s = s[:maxErrorTextBytes]
+	}
+	return s
+}
 
 // toBackends narrows a map[string]resilience.FullBackend to the
 // map[string]resilience.Backend shape resilience.Call expects. Every
@@ -52,11 +76,7 @@ func writeAllBackendsFailed(w http.ResponseWriter, requestID string, attempts []
 	w.WriteHeader(http.StatusBadGateway)
 	attemptBodies := make([]map[string]any, 0, len(attempts))
 	for _, a := range attempts {
-		errMsg := ""
-		if a.Err != nil {
-			errMsg = a.Err.Error()
-		}
-		attemptBodies = append(attemptBodies, map[string]any{"provider": a.Provider, "model": a.Model, "status": a.Status, "error": errMsg})
+		attemptBodies = append(attemptBodies, map[string]any{"provider": a.Provider, "model": a.Model, "status": a.Status, "error": scrubErrorText(a.Err)})
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"error":    map[string]any{"type": "all_backends_failed", "message": "every backend in the cascade failed", "request_id": requestID},

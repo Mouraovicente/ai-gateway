@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Mouraovicente/ai-gateway/internal/budget"
@@ -34,7 +36,20 @@ func (f *fakeLimiter) Allow(tenantID string, rpm int) (bool, int) {
 	return false, 5
 }
 
-type fakeBudget struct{ reserveErr error }
+// settleCall records one budget.Settle invocation, so tests can assert the
+// settle invariant: exactly one Settle per request, with the expected token
+// count, on every exit path (success, error, cancel).
+type settleCall struct {
+	reservationID string
+	realTokens    int
+}
+
+type fakeBudget struct {
+	reserveErr error
+
+	mu      sync.Mutex
+	settles []settleCall
+}
 
 func (f *fakeBudget) Reserve(ctx context.Context, tenantID, period string, estimatedTokens, monthlyLimit int) (core.Reservation, error) {
 	if f.reserveErr != nil {
@@ -43,7 +58,18 @@ func (f *fakeBudget) Reserve(ctx context.Context, tenantID, period string, estim
 	return core.Reservation{ID: "r1", TenantID: tenantID, Period: period, EstimatedTokens: estimatedTokens}, nil
 }
 func (f *fakeBudget) Settle(ctx context.Context, reservation core.Reservation, realTokens int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settles = append(f.settles, settleCall{reservationID: reservation.ID, realTokens: realTokens})
 	return nil
+}
+
+func (f *fakeBudget) settleCalls() []settleCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]settleCall, len(f.settles))
+	copy(out, f.settles)
+	return out
 }
 
 type fakeTrace struct{}
@@ -53,6 +79,31 @@ func (f *fakeTrace) RecordRequest(ctx context.Context, requestID, tenantID, alia
 }
 func (f *fakeTrace) RecordEvent(ctx context.Context, requestID string, seq int, eventType trace.EventType, node string, payload map[string]any) error {
 	return nil
+}
+
+// recordingTrace is a trace.Store that records the ordered sequence of
+// event types it was asked to record, so tests can assert the exact
+// trace_event sequence a request produces.
+type recordingTrace struct {
+	mu     sync.Mutex
+	events []trace.EventType
+}
+
+func (r *recordingTrace) RecordRequest(ctx context.Context, requestID, tenantID, alias string) error {
+	return nil
+}
+func (r *recordingTrace) RecordEvent(ctx context.Context, requestID string, seq int, eventType trace.EventType, node string, payload map[string]any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, eventType)
+	return nil
+}
+func (r *recordingTrace) types() []trace.EventType {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]trace.EventType, len(r.events))
+	copy(out, r.events)
+	return out
 }
 
 type fakeChatBackend struct{ content string }
@@ -126,10 +177,11 @@ func testRoutingWithFallback() *config.Routing {
 }
 
 func TestPipeline_HappyPath_ReturnsCompletionAndSettlesBudget(t *testing.T) {
+	fb := &fakeBudget{}
 	p := &Pipeline{
 		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free", RPMLimit: 10, MonthlyTokenBudget: 100000}},
 		RateLimit: &fakeLimiter{allow: true},
-		Budget:    &fakeBudget{},
+		Budget:    fb,
 		Routing:   testRouting(),
 		Backends:  map[string]resilience.FullBackend{"ollama": &fakeChatBackend{content: "ok"}},
 		Trace:     &fakeTrace{},
@@ -144,6 +196,10 @@ func TestPipeline_HappyPath_ReturnsCompletionAndSettlesBudget(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// fakeChatBackend reports PromptTokens: 5, CompletionTokens: 3 -> settle must carry 8, not 0 or 3.
+	if calls := fb.settleCalls(); len(calls) != 1 || calls[0].realTokens != 8 {
+		t.Fatalf("expected exactly one settle with realTokens=8, got %+v", calls)
 	}
 }
 
@@ -184,12 +240,14 @@ func TestPipeline_RateLimited_Returns429WithRetryAfter(t *testing.T) {
 }
 
 func TestPipeline_BudgetExceeded_Returns402(t *testing.T) {
+	fb := &fakeBudget{reserveErr: budget.ErrBudgetExceeded}
+	tr := &recordingTrace{}
 	p := &Pipeline{
 		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
 		RateLimit: &fakeLimiter{allow: true},
-		Budget:    &fakeBudget{reserveErr: budget.ErrBudgetExceeded},
+		Budget:    fb,
 		Routing:   testRouting(),
-		Trace:     &fakeTrace{},
+		Trace:     tr,
 	}
 	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
 
@@ -200,6 +258,14 @@ func TestPipeline_BudgetExceeded_Returns402(t *testing.T) {
 
 	if rec.Code != http.StatusPaymentRequired {
 		t.Fatalf("expected 402, got %d", rec.Code)
+	}
+	// Reserve failed before the settle defer is ever registered: no Settle call at all.
+	if calls := fb.settleCalls(); len(calls) != 0 {
+		t.Fatalf("expected zero settle calls when Reserve fails, got %+v", calls)
+	}
+	want := []trace.EventType{trace.Auth, trace.RateLimit, trace.BudgetReserve}
+	if got := tr.types(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("event sequence = %v, want %v", got, want)
 	}
 }
 
@@ -229,10 +295,11 @@ func TestPipeline_UnknownAlias_Returns400(t *testing.T) {
 }
 
 func TestPipeline_AllBackendsFailed_Returns502WithAttempts(t *testing.T) {
+	fb := &fakeBudget{}
 	p := &Pipeline{
 		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
 		RateLimit: &fakeLimiter{allow: true},
-		Budget:    &fakeBudget{},
+		Budget:    fb,
 		Routing:   testRouting(),
 		Backends:  map[string]resilience.FullBackend{}, // no backend registered for "ollama"
 		Trace:     &fakeTrace{},
@@ -247,6 +314,9 @@ func TestPipeline_AllBackendsFailed_Returns502WithAttempts(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
 	}
+	if calls := fb.settleCalls(); len(calls) != 1 || calls[0].realTokens != 0 {
+		t.Fatalf("expected exactly one settle with realTokens=0, got %+v", calls)
+	}
 }
 
 func TestPipeline_Streaming_FallsBackBeforeFirstByte(t *testing.T) {
@@ -257,10 +327,11 @@ func TestPipeline_Streaming_FallsBackBeforeFirstByte(t *testing.T) {
 		{Usage: &core.Usage{PromptTokens: 4, CompletionTokens: 2}},
 	}}
 
+	fb := &fakeBudget{}
 	p := &Pipeline{
 		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "standard"}},
 		RateLimit: &fakeLimiter{allow: true},
-		Budget:    &fakeBudget{},
+		Budget:    fb,
 		Routing:   testRoutingWithFallback(),
 		Backends:  map[string]resilience.FullBackend{"ollama": first, "openrouter": second},
 		Trace:     &fakeTrace{},
@@ -285,6 +356,10 @@ func TestPipeline_Streaming_FallsBackBeforeFirstByte(t *testing.T) {
 	if strings.Contains(body, "backend_stream_failed") {
 		t.Fatalf("did not expect a stream error event when the fallback target succeeds, got: %s", body)
 	}
+	// second's terminal usage chunk reports 4+2=6.
+	if calls := fb.settleCalls(); len(calls) != 1 || calls[0].realTokens != 6 {
+		t.Fatalf("expected exactly one settle with realTokens=6, got %+v", calls)
+	}
 }
 
 func TestPipeline_Streaming_StopsWithoutFallbackAfterFirstByte(t *testing.T) {
@@ -294,10 +369,11 @@ func TestPipeline_Streaming_StopsWithoutFallbackAfterFirstByte(t *testing.T) {
 	}
 	neverCalled := &fakeStreamBackend{streamChunks: []core.ChatChunk{{Delta: "should not appear"}}}
 
+	fb := &fakeBudget{}
 	p := &Pipeline{
 		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "standard"}},
 		RateLimit: &fakeLimiter{allow: true},
-		Budget:    &fakeBudget{},
+		Budget:    fb,
 		Routing:   testRoutingWithFallback(),
 		Backends:  map[string]resilience.FullBackend{"ollama": failsAfterTwoChunks, "openrouter": neverCalled},
 		Trace:     &fakeTrace{},
@@ -321,5 +397,71 @@ func TestPipeline_Streaming_StopsWithoutFallbackAfterFirstByte(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected the DONE sentinel even after the stream error, got: %s", body)
+	}
+	// failsAfterTwoChunks never sent a Usage chunk: real usage is unknown, settle releases the estimate with 0.
+	if calls := fb.settleCalls(); len(calls) != 1 || calls[0].realTokens != 0 {
+		t.Fatalf("expected exactly one settle with realTokens=0, got %+v", calls)
+	}
+}
+
+func TestPipeline_Streaming_HappyPath_EventSequenceAndSingleSettle(t *testing.T) {
+	backend := &fakeStreamBackend{streamChunks: []core.ChatChunk{
+		{Delta: "ok"},
+		{Usage: &core.Usage{PromptTokens: 4, CompletionTokens: 2}},
+	}}
+	fb := &fakeBudget{}
+	tr := &recordingTrace{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    fb,
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": backend},
+		Trace:     tr,
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","stream":true,"messages":[{"role":"user","content":"oi"}]}`))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	want := []trace.EventType{trace.Auth, trace.RateLimit, trace.BudgetReserve, trace.Route, trace.BackendAttempt, trace.BackendResult, trace.BudgetSettle}
+	if got := tr.types(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("event sequence = %v, want %v", got, want)
+	}
+	if calls := fb.settleCalls(); len(calls) != 1 || calls[0].realTokens != 6 {
+		t.Fatalf("expected exactly one settle with realTokens=6, got %+v", calls)
+	}
+}
+
+func TestPipeline_Streaming_ClientCancel_SettlesOnceQuietly(t *testing.T) {
+	backend := &fakeStreamBackend{streamChunks: []core.ChatChunk{{Delta: "hi"}}}
+	fb := &fakeBudget{}
+	p := &Pipeline{
+		Auth:      &fakeAuth{tenant: core.Tenant{ID: "tenant-1", Tier: "free"}},
+		RateLimit: &fakeLimiter{allow: true},
+		Budget:    fb,
+		Routing:   testRouting(),
+		Backends:  map[string]resilience.FullBackend{"ollama": backend},
+		Trace:     &fakeTrace{},
+	}
+	handler := RequestIDMiddleware(NewPipelineChatHandler(p))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate a client that is already gone by the time onChunk runs
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nuva/fast","stream":true,"messages":[{"role":"user","content":"oi"}]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), "backend_stream_failed") {
+		t.Fatalf("expected no in-band error event on client cancel, got: %s", rec.Body.String())
+	}
+	if calls := fb.settleCalls(); len(calls) != 1 {
+		t.Fatalf("expected exactly one settle call on client cancel, got %+v", calls)
 	}
 }

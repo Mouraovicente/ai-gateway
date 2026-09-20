@@ -59,12 +59,13 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit := func(eventType trace.EventType, node string, payload map[string]any) {
 			seq++
 			if err := p.Trace.RecordEvent(traceCtx, requestID, seq, eventType, node, payload); err != nil {
-				slog.Warn("trace: failed to record event", "request_id", requestID, "node", node, "error", err.Error())
+				slog.Error("trace: failed to record event", "request_id", requestID, "seq", seq, "type", string(eventType), "error", err.Error())
 			}
 		}
 
 		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if apiKey == "" {
+			emit(trace.Auth, "auth", map[string]any{"status": "denied", "reason": "missing_header"})
 			WriteError(w, requestID, http.StatusUnauthorized, "missing_api_key", "missing Authorization header")
 			return
 		}
@@ -129,21 +130,25 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "reservation_id": reservation.ID, "estimated_tokens": estimated})
 
 		if err := p.Trace.RecordRequest(traceCtx, requestID, tenant.ID, body.Model); err != nil {
-			slog.Warn("trace: failed to record request", "request_id", requestID, "error", err.Error())
+			slog.Error("trace: failed to record request", "request_id", requestID, "error", err.Error())
 		}
 
-		// realTokens is settled in this defer on every exit path (success,
-		// error, client cancel): 0 unless a call below reports real usage,
-		// which simply releases the pessimistic estimate made above.
-		realTokens := 0
+		// usage is settled in this defer on every exit path (success, error,
+		// client cancel): zero value unless a call below reports real usage,
+		// which simply releases the pessimistic estimate made above. It is
+		// the single source of truth for both budget.Settle (which only
+		// wants the total) and the usage_publish event (which needs the
+		// prompt/completion split intact).
+		var usage core.Usage
 		defer func() {
+			realTokens := usage.PromptTokens + usage.CompletionTokens
 			if err := p.Budget.Settle(traceCtx, reservation, realTokens); err != nil {
-				slog.Warn("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
+				slog.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
 			}
 			emit(trace.BudgetSettle, "budget", map[string]any{"tenant_id": tenant.ID, "real_tokens": realTokens})
 			if p.Usage != nil {
-				if err := p.Usage.Publish(traceCtx, requestID, core.Usage{CompletionTokens: realTokens}); err != nil {
-					slog.Warn("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
+				if err := p.Usage.Publish(traceCtx, requestID, usage); err != nil {
+					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
 				} else {
 					emit(trace.UsagePublish, "usage", map[string]any{"tenant_id": tenant.ID})
 				}
@@ -159,7 +164,7 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit(trace.Route, "router", map[string]any{"targets": len(targets)})
 
 		if body.Stream {
-			serveStreamPipeline(w, r, p, targets, chatReq, requestID, &realTokens, emit)
+			serveStreamPipeline(w, r, p, targets, chatReq, requestID, &usage, emit)
 			return
 		}
 
@@ -178,9 +183,9 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
 		}
-		emit(trace.BackendResult, "resilience", map[string]any{"provider": target.Provider, "model": target.Model})
+		emit(trace.BackendResult, "resilience", map[string]any{"provider": target.Provider, "model": target.Model, "status": "ok", "prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens})
 
-		realTokens = resp.Usage.PromptTokens + resp.Usage.CompletionTokens
+		usage = resp.Usage
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -209,9 +214,10 @@ func isClientCancelled(ctx context.Context, err error) bool {
 // surfaces as the SSE event "backend_stream_failed" followed by [DONE]. A
 // client disconnect mid-stream is detected via onChunk and stops quietly,
 // without writing an error event to a socket nobody is reading from anymore.
-// realTokens is filled in from the final reported usage so the caller's
-// deferred budget.Settle sees real, not estimated, tokens.
-func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, realTokens *int, emit func(trace.EventType, string, map[string]any)) {
+// usage is filled in from the final reported core.Usage (prompt/completion
+// split intact) so the caller's deferred budget.Settle and usage_publish see
+// real, not estimated, numbers.
+func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, emit func(trace.EventType, string, map[string]any)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		WriteError(w, requestID, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support flushing")
@@ -229,11 +235,18 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 		return backend, nil
 	}
 
+	start := time.Now()
+	var ttfb time.Duration
+	ttfbSet := false
 	onChunk := func(chunk core.ChatChunk) error {
 		select {
 		case <-r.Context().Done():
 			return r.Context().Err()
 		default:
+		}
+		if !ttfbSet && chunk.Delta != "" {
+			ttfb = time.Since(start)
+			ttfbSet = true
 		}
 		payload, _ := json.Marshal(map[string]any{
 			"id":      requestID,
@@ -245,11 +258,25 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 		return nil
 	}
 
-	usage, attempts, streamErr := resilience.CallStream(r.Context(), targets, resolve, chatReq, onChunk)
+	result, attempts, streamErr := resilience.CallStream(r.Context(), targets, resolve, chatReq, onChunk)
 	for _, a := range attempts {
 		emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 	}
-	*realTokens = usage.PromptTokens + usage.CompletionTokens
+	*usage = result
+
+	if streamErr == nil {
+		var succeeded resilience.Attempt
+		for _, a := range attempts {
+			if a.Err == nil {
+				succeeded = a
+			}
+		}
+		emit(trace.BackendResult, "resilience", map[string]any{
+			"provider": succeeded.Provider, "model": succeeded.Model, "status": "ok",
+			"latency_ms": time.Since(start).Milliseconds(), "ttft_ms": ttfb.Milliseconds(),
+			"prompt_tokens": result.PromptTokens, "completion_tokens": result.CompletionTokens,
+		})
+	}
 
 	if streamErr != nil && isClientCancelled(r.Context(), streamErr) {
 		emit(trace.Error, "resilience", map[string]any{"reason": "client_closed"})
@@ -262,7 +289,7 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 			reason = "stream_failed_after_first_byte"
 		}
 		emit(trace.Error, "resilience", map[string]any{"reason": reason})
-		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": streamErr.Error(), "request_id": requestID}})
+		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "backend_stream_failed", "message": scrubErrorText(streamErr), "request_id": requestID}})
 		fmt.Fprintf(w, "data: %s\n\n", payload)
 		flusher.Flush()
 	}
