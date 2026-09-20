@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Mouraovicente/ai-gateway/internal/config"
@@ -80,5 +81,32 @@ func TestResolve_AliasCascadeWithUnknownProviderReturnsErrUnknownProvider(t *tes
 	}
 	if upErr.Provider != "not-configured" || upErr.Alias != "nuva/broken" {
 		t.Fatalf("unexpected error fields: %+v", upErr)
+	}
+}
+
+// TestResolve_RejectsHostileModelNames covers the charset gate: these are
+// the shapes that would otherwise reach a provider URL path or body.
+func TestResolve_RejectsHostileModelNames(t *testing.T) {
+	routing := &config.Routing{
+		Aliases:   map[string]config.AliasTiers{},
+		Providers: map[string]config.Provider{"gemini": {}},
+	}
+	hostile := []string{
+		"gemini/../../v1/other-api",
+		"gemini/x?alt=sse&foo=bar",
+		"gemini/x#frag",
+		"gemini/x\x00y",
+		"gemini/x y",
+		"gemini/" + strings.Repeat("m", 300),
+		"",
+	}
+	for _, model := range hostile {
+		if _, err := Resolve(routing, model, "premium"); !errors.Is(err, ErrUnknownModel) {
+			t.Errorf("Resolve(%q) err = %v, want ErrUnknownModel", model, err)
+		}
+	}
+	// A legitimate direct target still resolves.
+	if _, err := Resolve(routing, "gemini/gemini-1.5-pro", "premium"); err != nil {
+		t.Fatalf("legitimate direct target rejected: %v", err)
 	}
 }

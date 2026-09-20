@@ -94,7 +94,9 @@ func writeRouterError(w http.ResponseWriter, requestID string, err error) int {
 		// router.ErrUnknownModel and anything else Resolve can return.
 		status, errType = http.StatusBadRequest, "unknown_model"
 	}
-	WriteError(w, requestID, status, errType, err.Error())
+	// scrubErrorText also bounds length: the router's message embeds the
+	// model string the caller sent, which can be most of a 1 MiB body.
+	WriteError(w, requestID, status, errType, scrubErrorText(err))
 	return status
 }
 

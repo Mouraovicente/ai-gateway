@@ -17,6 +17,13 @@ import (
 // The API layer maps this to a 401.
 var ErrUnknownAPIKey = errors.New("auth: unknown api key")
 
+// ErrInvalidTenantConfig is returned when a tenant row exists but is not
+// usable: a missing or non-positive rpm_limit would otherwise become
+// rate.NewLimiter(0,0) (permanent 429 with a 292-year Retry-After) and a
+// missing monthly_token_budget would become a permanent, silent 402. A
+// seeding mistake must fail loudly, not look like a throttled tenant.
+var ErrInvalidTenantConfig = errors.New("auth: tenant record is incomplete")
+
 // HashAPIKey returns the SHA-256 hex digest of an API key. Keys are never
 // stored or logged in plaintext; only this hash is persisted, as the pk of
 // the tenants table.
@@ -71,6 +78,9 @@ func (s *dynamoStore) ResolveAPIKey(ctx context.Context, apiKey string) (core.Te
 	var item tenantItem
 	if err := attributevalue.UnmarshalMap(out.Item, &item); err != nil {
 		return core.Tenant{}, fmt.Errorf("auth: unmarshaling tenant: %w", err)
+	}
+	if item.TenantID == "" || item.Tier == "" || item.RPMLimit <= 0 || item.MonthlyTokenBudget <= 0 {
+		return core.Tenant{}, fmt.Errorf("%w (tenant_id=%q)", ErrInvalidTenantConfig, item.TenantID)
 	}
 	return core.Tenant{
 		ID:                 item.TenantID,

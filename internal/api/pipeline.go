@@ -119,9 +119,21 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		requestID := RequestIDFromContext(ctx)
 		requestSpan.SetAttributes(otelattr.String("request_id", requestID))
 		seq := 0
+		clientRequestID := ClientRequestIDFromContext(ctx)
 		emit := func(eventType trace.EventType, node string, payload map[string]any) {
 			seq++
-			if err := p.Trace.RecordEvent(traceCtx, requestID, seq, eventType, node, payload); err != nil {
+			if clientRequestID != "" {
+				if payload == nil {
+					payload = map[string]any{}
+				}
+				payload["client_request_id"] = clientRequestID
+			}
+			// Bounded even though traceCtx is uncancellable: under a
+			// DynamoDB throttle the SDK's own retries would otherwise hold
+			// this goroutine (and, in the defer below, shutdown) open.
+			eventCtx, cancelEvent := context.WithTimeout(traceCtx, 5*time.Second)
+			defer cancelEvent()
+			if err := p.Trace.RecordEvent(eventCtx, requestID, seq, eventType, node, payload); err != nil {
 				logger.Error("trace: failed to record event", "request_id", requestID, "seq", seq, "type", string(eventType), "error", err.Error())
 			}
 		}
@@ -162,6 +174,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			// caller "your key is invalid" during a DynamoDB throttle is
 			// both the wrong instruction to the client and the wrong
 			// diagnosis for whoever is on call.
+			if errors.Is(err, auth.ErrInvalidTenantConfig) {
+				// Seeding/config error, not an outage: retrying will not
+				// fix it, so do not advertise Retry-After.
+				logger.Error("auth: tenant record is unusable", "request_id", requestID, "error", err.Error())
+				emit(trace.Auth, "auth", map[string]any{"status": "error", "reason": "tenant_misconfigured"})
+				writeErr(http.StatusInternalServerError, "tenant_misconfigured", "tenant record is incomplete")
+				return
+			}
 			if !errors.Is(err, auth.ErrUnknownAPIKey) {
 				logger.Error("auth: tenant store unavailable", "request_id", requestID, "error", err.Error())
 				emit(trace.Auth, "auth", map[string]any{"status": "error", "reason": "store_unavailable"})
@@ -186,7 +206,8 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var body chatCompletionRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil {
 			status := http.StatusBadRequest
 			msg := "malformed JSON body"
 			var maxBytesErr *http.MaxBytesError
@@ -195,6 +216,10 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				msg = "request body too large"
 			}
 			writeErr(status, "invalid_request", msg)
+			return
+		}
+		if dec.More() {
+			writeErr(http.StatusBadRequest, "invalid_request", "unexpected data after JSON body")
 			return
 		}
 		if len(body.Messages) == 0 {
@@ -221,6 +246,13 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		messages := make([]core.Message, 0, len(body.Messages))
 		promptBytes := 0
 		for _, m := range body.Messages {
+			// An unknown role is a 4xx from the provider anyway — after a
+			// budget reservation and a paid round trip. Cheaper and more
+			// honest to answer it here.
+			if m.Role != "system" && m.Role != "user" && m.Role != "assistant" {
+				writeErr(http.StatusBadRequest, "invalid_request", "message role must be system, user or assistant")
+				return
+			}
 			messages = append(messages, core.Message{Role: m.Role, Content: m.Content})
 			promptBytes += len(m.Content)
 		}
@@ -242,7 +274,11 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				writeErr(http.StatusPaymentRequired, "budget_exceeded", "monthly token budget exceeded")
 				return
 			}
-			writeErr(http.StatusInternalServerError, "internal_error", "failed to reserve budget")
+			// Same reasoning as the auth path: a store outage is a
+			// retryable 503, not a permanent failure of this request.
+			logger.Error("budget: store unavailable", "request_id", requestID, "error", err.Error())
+			w.Header().Set("Retry-After", "1")
+			writeErr(http.StatusServiceUnavailable, "store_unavailable", "budget store temporarily unavailable")
 			return
 		}
 		emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "reservation_id": reservation.ID, "estimated_tokens": estimated})
@@ -267,12 +303,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		status := "ok"
 		errorClass := ""
 		defer func() {
-			realTokens := respUsage.PromptTokens + respUsage.CompletionTokens
-			_, settleSpan := tracer.Start(traceCtx, "budget.settle")
-			if err := p.Budget.Settle(traceCtx, reservation, realTokens); err != nil {
+			realTokens := sanitizeRealTokens(respUsage, estimated, requestID, logger)
+			settleCtx, cancelSettle := context.WithTimeout(traceCtx, 5*time.Second)
+			settleCtx, settleSpan := tracer.Start(settleCtx, "budget.settle")
+			if err := p.Budget.Settle(settleCtx, reservation, realTokens); err != nil {
 				logger.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
 			}
 			settleSpan.End()
+			cancelSettle()
 			emit(trace.BudgetSettle, "budget", map[string]any{"tenant_id": tenant.ID, "real_tokens": realTokens})
 			latencyMs := int(time.Since(start).Milliseconds())
 			if p.Usage != nil {
@@ -326,7 +364,11 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				}
 			}
 			if p.Stats != nil && status == "ok" {
-				p.Stats.Record(body.Model, target.Model, tenant.ID, latencyMs, realTokens)
+				// Same cardinality rule the metrics use: a premium caller
+				// naming a model directly must not be able to mint a new
+				// recorder key per request.
+				statsRoute, statsModel := metricLabels(p.Routing, body.Model, target.Model)
+				p.Stats.Record(statsRoute, statsModel, tenant.ID, latencyMs, realTokens)
 			}
 		}()
 
@@ -399,13 +441,36 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		})
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"id":      requestID,
 			"object":  "chat.completion",
 			"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": resp.Message.Content}, "finish_reason": resp.FinishReason}},
 			"usage":   map[string]int{"prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens},
-		})
+		}); err != nil {
+			// Mid-body write failure: the status line already said 200, so
+			// the only honest thing left is to log it rather than let it
+			// pass as a clean success.
+			logger.Error("response: failed to write completion body", "request_id", requestID, "error", err.Error())
+		}
 	})
+}
+
+// sanitizeRealTokens bounds the provider-reported usage before it reaches
+// budget.Settle, Stats and the token metric. A negative total would *credit*
+// the tenant's monthly budget permanently (Settle does ADD used :delta), and
+// an absurdly large one would overcharge; neither is something a provider
+// should be trusted to get right. The accepted window is
+// [0, 4*estimated] — four times the pessimistic pre-call estimate is far
+// above any honest reading — and anything outside it falls back to the
+// estimate, which is what was already reserved.
+func sanitizeRealTokens(u core.Usage, estimated int, requestID string, logger *slog.Logger) int {
+	real := u.PromptTokens + u.CompletionTokens
+	if real < 0 || real > estimated*4 {
+		logger.Warn("usage: provider reported implausible token usage, falling back to the estimate",
+			"request_id", requestID, "reported_tokens", real, "estimated_tokens", estimated)
+		return estimated
+	}
+	return real
 }
 
 // lastAttemptModel returns the model name of the last resilience attempt, or

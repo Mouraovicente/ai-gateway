@@ -42,6 +42,11 @@ func (e *ErrUnknownProvider) Is(target error) bool {
 // "nuva/fast", or a direct "provider/model" name) plus the caller's tier
 // into an ordered cascade of backend targets to try in order.
 func Resolve(routing *config.Routing, model, tier string) ([]core.BackendTarget, error) {
+	// Charset check first, for aliases and direct targets alike: a name
+	// that cannot be a legitimate model is never worth resolving.
+	if !ValidModel(model) {
+		return nil, ErrUnknownModel
+	}
 	if alias, ok := routing.Aliases[model]; ok {
 		cascade, ok := alias.Tiers[tier]
 		if !ok || len(cascade) == 0 {

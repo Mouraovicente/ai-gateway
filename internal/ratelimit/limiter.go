@@ -20,6 +20,9 @@ type Limiter interface {
 	Allow(tenantID string, rpm int) (allowed bool, retryAfterSeconds int)
 }
 
+// maxRetryAfterSeconds caps the Retry-After the gateway ever advertises.
+const maxRetryAfterSeconds = 300
+
 // tenantLimiter pairs a rate.Limiter with the rpm it was last configured
 // for, so a tier change (different rpm for the same tenant) can be detected
 // and applied instead of silently reusing the original limit forever.
@@ -51,6 +54,12 @@ func (t *tenantLimiter) allow(rpm int) (bool, int) {
 	retryAfter := int(math.Ceil(delay.Seconds()))
 	if retryAfter < 1 {
 		retryAfter = 1
+	}
+	// Defense in depth: rate.InfDuration (an rpm that made the limiter
+	// unusable) would otherwise be handed to the client as a Retry-After of
+	// ~292 years, which a well-behaved client may honour.
+	if retryAfter > maxRetryAfterSeconds {
+		retryAfter = maxRetryAfterSeconds
 	}
 	return false, retryAfter
 }

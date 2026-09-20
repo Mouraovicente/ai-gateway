@@ -77,3 +77,35 @@ func TestResolveAPIKey_WithFakeClient_PropagatesClientError(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
+
+// TestResolveAPIKey_RejectsIncompleteTenantRecord: a row missing rpm_limit
+// or monthly_token_budget must fail loudly instead of becoming a permanent
+// 429 (rate.NewLimiter(0,0) never allows) or a permanent, silent 402.
+func TestResolveAPIKey_RejectsIncompleteTenantRecord(t *testing.T) {
+	cases := map[string]map[string]any{
+		"missing rpm": {
+			"api_key_hash":         HashAPIKey("key-1"),
+			"tenant_id":            "tenant-x",
+			"tier":                 "free",
+			"monthly_token_budget": 1000,
+		},
+		"missing budget": {
+			"api_key_hash": HashAPIKey("key-1"),
+			"tenant_id":    "tenant-x",
+			"tier":         "free",
+			"rpm_limit":    10,
+		},
+		"missing tenant id": {
+			"api_key_hash":         HashAPIKey("key-1"),
+			"tier":                 "free",
+			"rpm_limit":            10,
+			"monthly_token_budget": 1000,
+		},
+	}
+	for name, item := range cases {
+		store := NewDynamoStore(&fakeGetItemAPI{item: item}, "tenants")
+		if _, err := store.ResolveAPIKey(context.Background(), "key-1"); !errors.Is(err, ErrInvalidTenantConfig) {
+			t.Errorf("%s: err = %v, want ErrInvalidTenantConfig", name, err)
+		}
+	}
+}
