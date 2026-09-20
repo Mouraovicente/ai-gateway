@@ -228,6 +228,10 @@ Error types (JSON body `{"error":{"type","message","request_id"}}`, plus HTTP st
 - Fixtures: Ollama's fixtures and OpenRouter's non-streaming success fixture (`internal/backend/{ollama,openrouter}/testdata/*.json`) were recorded against real calls. OpenRouter's streaming fixture and `chat_error.json` (429) are synthetic, as is Gemini's fixture (`internal/backend/gemini/testdata/generate_success.json`), pending a real `GEMINI_API_KEY`/streaming capture to record live ones.
 - CI jobs (`.github/workflows/ci.yml`): `test` (`go vet`, `go test -race`, `golangci-lint`, `gitleaks`), `integration` (LocalStack + `-tags integration`), `terraform-plan` (`tflocal plan` with `enable_fargate=false`, DynamoDB + SQS only).
 
+## Performance
+
+Local benchmark against a stub Ollama backend (isolates gateway overhead from real model inference): full pipeline sustains only **~7 req/s** at concurrency 10-100, while the cheap auth-reject path alone does **~65 req/s**. That gap points at the real bottleneck — LocalStack's single-process DynamoDB/SQS emulation, not the gateway's own code, since throughput stays flat whether the backend answers instantly or with an artificial 200ms delay. Real AWS DynamoDB/SQS would very likely move this ceiling much higher. Full method, numbers and caveats: `docs/benchmarks/2026-09-20-local.md`. Reproduce with `bash bench/run.sh`.
+
 ## Deploy
 
 See `docs/deploy-fargate.md` for a real ECS Fargate deploy (manual `apply` against a real AWS account, outside LocalStack). Fargate is behind the `enable_fargate` Terraform flag, off by default and off in CI — LocalStack Community doesn't emulate ECS/ALB well enough to validate it. Provider secrets (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`) are passed by ARN via `provider_secret_arns`, resolved from Secrets Manager, never as plain task-definition environment variables.
