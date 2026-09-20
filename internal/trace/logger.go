@@ -10,6 +10,12 @@ import (
 // emit, because they could contain prompt/completion content or secrets.
 var ForbiddenKeys = []string{"message", "messages", "answer", "trace", "content", "payload", "prompt", "completion"}
 
+// IsForbiddenKey reports whether key is one the logger and every trace
+// store must refuse, case-insensitively. Exported so alternative store
+// implementations (internal/memstore) enforce the same list instead of
+// keeping their own copy.
+func IsForbiddenKey(key string) bool { return isForbidden(key) }
+
 // isForbidden reports whether key matches a forbidden key, case-insensitively.
 func isForbidden(key string) bool {
 	for _, k := range ForbiddenKeys {

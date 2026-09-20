@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"strconv"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/backend/openrouter"
 	"github.com/Mouraovicente/ai-gateway/internal/budget"
 	"github.com/Mouraovicente/ai-gateway/internal/config"
+	"github.com/Mouraovicente/ai-gateway/internal/memstore"
 	"github.com/Mouraovicente/ai-gateway/internal/ratelimit"
 	"github.com/Mouraovicente/ai-gateway/internal/resilience"
 	"github.com/Mouraovicente/ai-gateway/internal/stats"
@@ -66,17 +68,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		logger.Error("loading AWS config", "error", err)
-		os.Exit(1)
+	// STORE_BACKEND=memory swaps all four storage ports for in-process
+	// implementations: no AWS at all. It exists for local development and
+	// for the benchmark that needs to measure this gateway rather than
+	// LocalStack's emulator. Never for production, hence the warning below.
+	memoryMode := strings.EqualFold(getenv("STORE_BACKEND", "dynamodb"), "memory")
+
+	var dynamoClient *dynamodb.Client
+	var sqsClient *sqs.Client
+	if !memoryMode {
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+		if err != nil {
+			logger.Error("loading AWS config", "error", err)
+			os.Exit(1)
+		}
+		// AWS_ENDPOINT_URL points DynamoDB calls at LocalStack in local/dev;
+		// in a real AWS account it is unset and the SDK resolves the real
+		// endpoint.
+		if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
+			awsCfg.BaseEndpoint = &endpoint
+		}
+		dynamoClient = dynamodb.NewFromConfig(awsCfg)
+		sqsClient = sqs.NewFromConfig(awsCfg)
 	}
-	// AWS_ENDPOINT_URL points DynamoDB calls at LocalStack in local/dev; in a
-	// real AWS account it is unset and the SDK resolves the real endpoint.
-	if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
-		awsCfg.BaseEndpoint = &endpoint
-	}
-	dynamoClient := dynamodb.NewFromConfig(awsCfg)
 
 	// Only providers with the credentials/URL to actually reach them are
 	// registered. Resolving to an unregistered provider surfaces later as an
@@ -119,16 +133,42 @@ func main() {
 	}
 	logger.Info("registered backend providers", "providers", registered)
 
-	sqsClient := sqs.NewFromConfig(awsCfg)
-	usageQueueName := getenv("USAGE_QUEUE_NAME", "usage-events")
-	usageQueueOut, err := sqsClient.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: strPtr(usageQueueName)})
-	if err != nil {
-		logger.Error("resolving usage queue URL (did terraform apply run?)", "queue", usageQueueName, "error", err)
-		os.Exit(1)
+	// The four storage ports, resolved once by backend so nothing below
+	// needs to know which one is in play.
+	var (
+		authStore   auth.Store
+		budgetStore budget.Store
+		traceBase   trace.Store
+		usageBase   usage.Publisher
+	)
+	if memoryMode {
+		logger.Warn("STORE_BACKEND=memory: tenants, budgets, traces and usage events live in process memory only. " +
+			"Nothing is persisted, nothing is shared between replicas, and the dev API keys are public. " +
+			"This mode is for local development and benchmarks ONLY — never run it in production.")
+		devTenantsPath := getenv("DEV_TENANTS_CONFIG", "config/tenants.dev.yaml")
+		devTenants, err := config.LoadDevTenants(devTenantsPath)
+		if err != nil {
+			logger.Error("loading dev tenants", "error", err)
+			os.Exit(1)
+		}
+		authStore = memstore.NewAuthStore(devTenants)
+		budgetStore = memstore.NewBudgetStore()
+		traceBase = memstore.NewTraceStore()
+		usageBase = memstore.NewUsagePublisher()
+		logger.Info("memory store backend ready", "tenants", len(devTenants), "config", devTenantsPath)
+	} else {
+		usageQueueName := getenv("USAGE_QUEUE_NAME", "usage-events")
+		usageQueueOut, err := sqsClient.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: strPtr(usageQueueName)})
+		if err != nil {
+			logger.Error("resolving usage queue URL (did terraform apply run?)", "queue", usageQueueName, "error", err)
+			os.Exit(1)
+		}
+		authStore = auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants"))
+		budgetStore = budget.NewDynamoStore(dynamoClient, getenv("BUDGETS_TABLE", "budgets"), getenv("RESERVATIONS_TABLE", "reservations"))
+		traceBase = trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events"))
+		usageBase = usage.NewSQSPublisher(sqsClient, *usageQueueOut.QueueUrl)
 	}
-	usageQueueURL := *usageQueueOut.QueueUrl
 
-	authStore := auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants"))
 	statsRecorder := stats.NewInMemoryRecorder(5 * time.Minute)
 
 	// OTel is optional: OTEL_EXPORTER_OTLP_ENDPOINT unset means no exporter is
@@ -182,12 +222,10 @@ func main() {
 		logger.Error("registering queue metrics", "error", err)
 		os.Exit(1)
 	}
-	asyncTrace = trace.NewAsyncStore(
-		trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events")),
+	asyncTrace = trace.NewAsyncStore(traceBase,
 		atoiDefault(os.Getenv("TRACE_QUEUE_SIZE"), trace.DefaultTraceQueueSize),
 		logger, &trace.AsyncQueueMetrics{Dropped: queueInstruments.TraceDropped})
-	asyncUsage = usage.NewAsyncPublisher(
-		usage.NewSQSPublisher(sqsClient, usageQueueURL),
+	asyncUsage = usage.NewAsyncPublisher(usageBase,
 		atoiDefault(os.Getenv("USAGE_QUEUE_SIZE"), usage.DefaultQueueSize),
 		logger, queueInstruments.UsageDropped)
 
@@ -199,7 +237,7 @@ func main() {
 		IPLimit:   ipLimiter,
 		Auth:      authStore,
 		RateLimit: ratelimit.NewInMemoryLimiter(),
-		Budget:    budget.NewDynamoStore(dynamoClient, getenv("BUDGETS_TABLE", "budgets"), getenv("RESERVATIONS_TABLE", "reservations")),
+		Budget:    budgetStore,
 		Routing:   routing,
 		Backends:  backends,
 		Trace:     asyncTrace,
@@ -223,10 +261,13 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if _, err := dynamoClient.DescribeTable(checkCtx, &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"store unavailable"}`))
-			return
+		// In memory mode there is no store to be unavailable.
+		if dynamoClient != nil {
+			if _, err := dynamoClient.DescribeTable(checkCtx, &dynamodb.DescribeTableInput{TableName: strPtr(tenantsTable)}); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"status":"store unavailable"}`))
+				return
+			}
 		}
 		// At least one backend must be reachable: Ollama is checked live via
 		// Tags; a paid provider counts as ready simply by having a

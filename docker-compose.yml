@@ -11,6 +11,10 @@ services:
       - AWS_SECRET_ACCESS_KEY=test
       - USAGE_QUEUE_NAME=usage-events
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      # Set STORE_BACKEND=memory to run with no AWS at all (tenants from
+      # config/tenants.dev.yaml, budgets/traces/usage in process memory).
+      # Local development and benchmarks only — see internal/memstore.
+      # - STORE_BACKEND=memory
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

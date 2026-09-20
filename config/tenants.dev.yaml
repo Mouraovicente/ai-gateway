@@ -1,0 +1,29 @@
+# Dev-only tenants for STORE_BACKEND=memory.
+#
+# These API keys are fake, public, and identical to the ones
+# scripts/seed_tenants.go writes into LocalStack — they exist so `go run
+# ./cmd/gateway` works with no AWS at all. Never add a real key here, and
+# never run memory mode anywhere but a laptop or a benchmark.
+tenants:
+  - api_key: dev-free-key
+    tenant_id: tenant-free
+    tier: free
+    rpm_limit: 10
+    monthly_token_budget: 50000
+  - api_key: dev-standard-key
+    tenant_id: tenant-standard
+    tier: standard
+    rpm_limit: 30
+    monthly_token_budget: 500000
+  - api_key: dev-premium-key
+    tenant_id: tenant-premium
+    tier: premium
+    rpm_limit: 60
+    monthly_token_budget: 2000000
+  # Benchmark tenant: the limits are deliberately absurd so bench/run.sh
+  # measures the gateway, not the rate limiter.
+  - api_key: bench-key
+    tenant_id: tenant-bench
+    tier: free
+    rpm_limit: 1000000
+    monthly_token_budget: 1000000000
