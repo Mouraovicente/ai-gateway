@@ -14,6 +14,9 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/Mouraovicente/ai-gateway/internal/api"
 	"github.com/Mouraovicente/ai-gateway/internal/auth"
@@ -116,6 +119,33 @@ func main() {
 	authStore := auth.NewDynamoStore(dynamoClient, getenv("TENANTS_TABLE", "tenants"))
 	statsRecorder := stats.NewInMemoryRecorder(5 * time.Minute)
 
+	// OTel is optional: OTEL_EXPORTER_OTLP_ENDPOINT unset means no exporter is
+	// installed and trace.Tracer()/the meter fall back to OTel's global
+	// no-op implementations, so the gateway behaves exactly as before.
+	// Exporter failures never affect requests — spans/metrics are just
+	// dropped in the background by the SDK's own batching/export goroutines.
+	var tracerProvider *sdktrace.TracerProvider
+	var meterProvider *sdkmetric.MeterProvider
+	meter := otel.GetMeterProvider().Meter("ai-gateway")
+	if otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); otlpEndpoint != "" {
+		tracerProvider, err = trace.NewTracerProvider(ctx, otlpEndpoint)
+		if err != nil {
+			logger.Error("starting tracer provider", "error", err)
+			os.Exit(1)
+		}
+		meterProvider, err = trace.NewMeterProvider(ctx, otlpEndpoint)
+		if err != nil {
+			logger.Error("starting meter provider", "error", err)
+			os.Exit(1)
+		}
+		meter = meterProvider.Meter("ai-gateway")
+	}
+	metrics, err := trace.NewMetrics(meter)
+	if err != nil {
+		logger.Error("registering metrics", "error", err)
+		os.Exit(1)
+	}
+
 	pipeline := &api.Pipeline{
 		Auth:      authStore,
 		RateLimit: ratelimit.NewInMemoryLimiter(),
@@ -125,6 +155,8 @@ func main() {
 		Trace:     trace.NewDynamoStore(dynamoClient, getenv("REQUESTS_TABLE", "requests"), getenv("TRACE_EVENTS_TABLE", "trace_events")),
 		Usage:     usage.NewSQSPublisher(sqsClient, usageQueueURL),
 		Stats:     statsRecorder,
+		Tracer:    trace.Tracer(),
+		Metrics:   metrics,
 	}
 
 	tenantsTable := getenv("TENANTS_TABLE", "tenants")
@@ -210,6 +242,18 @@ func main() {
 		defer cancel()
 		if err := server.Shutdown(timeoutCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
+		}
+		otelShutdownCtx, cancelOtel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelOtel()
+		if tracerProvider != nil {
+			if err := tracerProvider.Shutdown(otelShutdownCtx); err != nil {
+				logger.Error("tracer provider shutdown failed", "error", err)
+			}
+		}
+		if meterProvider != nil {
+			if err := meterProvider.Shutdown(otelShutdownCtx); err != nil {
+				logger.Error("meter provider shutdown failed", "error", err)
+			}
 		}
 	}()
 

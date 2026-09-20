@@ -6,10 +6,12 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - AWS_ENDPOINT_URL=http://localstack:4566
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       - localstack
+      - otel-collector
 
   localstack:
     image: localstack/localstack:3
@@ -24,6 +26,7 @@ services:
       - ./deploy/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
     ports:
       - "4318:4318"
+      - "8889:8889"
 
   tempo:
     image: grafana/tempo:2.5.0
@@ -46,3 +49,7 @@ services:
       - "3000:3000"
     volumes:
       - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./deploy/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+      - tempo

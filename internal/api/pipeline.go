@@ -21,6 +21,10 @@ import (
 	"github.com/Mouraovicente/ai-gateway/internal/stats"
 	"github.com/Mouraovicente/ai-gateway/internal/trace"
 	"github.com/Mouraovicente/ai-gateway/internal/usage"
+	otelattr "go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Pipeline wires every module the real /v1/chat/completions handler needs.
@@ -38,6 +42,12 @@ type Pipeline struct {
 	// usage_publish trace event / stats recording in that case.
 	Usage usage.Publisher
 	Stats stats.Recorder
+	// Tracer and Metrics are Task 13's OTel hooks. Both may be left nil (the
+	// default in every pre-Task-13 test); NewPipelineChatHandler falls back
+	// to a no-op tracer and simply skips metric recording when Metrics is
+	// nil, so OTel stays fully optional.
+	Tracer  oteltrace.Tracer
+	Metrics *trace.Metrics
 }
 
 // NewPipelineChatHandler is the real handler for POST /v1/chat/completions:
@@ -47,14 +57,23 @@ type Pipeline struct {
 // resilience.CallStream for the streaming-specific rule about stopping
 // fallback once the first byte has reached the client.
 func NewPipelineChatHandler(p *Pipeline) http.Handler {
+	tracer := p.Tracer
+	if tracer == nil {
+		tracer = noop.NewTracerProvider().Tracer("ai-gateway")
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		ctx := r.Context()
+		// requestSpan is the root span of the trace: metadata only
+		// (request_id/tenant_id/tier/alias/provider/model/http.status_code/
+		// error.class), never messages/prompts/completions/keys.
+		ctx, requestSpan := tracer.Start(r.Context(), "POST /v1/chat/completions")
+		defer requestSpan.End()
 		// traceCtx survives a client disconnect: trace events, the budget
 		// settle and the usage publish must still happen even when the
 		// request context is already cancelled by the time we get there.
 		traceCtx := context.WithoutCancel(ctx)
 		requestID := RequestIDFromContext(ctx)
+		requestSpan.SetAttributes(otelattr.String("request_id", requestID))
 		seq := 0
 		emit := func(eventType trace.EventType, node string, payload map[string]any) {
 			seq++
@@ -66,16 +85,21 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if apiKey == "" {
 			emit(trace.Auth, "auth", map[string]any{"status": "denied", "reason": "missing_header"})
+			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusUnauthorized))
 			WriteError(w, requestID, http.StatusUnauthorized, "missing_api_key", "missing Authorization header")
 			return
 		}
-		tenant, err := p.Auth.ResolveAPIKey(ctx, apiKey)
+		authCtx, authSpan := tracer.Start(ctx, "auth")
+		tenant, err := p.Auth.ResolveAPIKey(authCtx, apiKey)
+		authSpan.End()
 		if err != nil {
 			emit(trace.Auth, "auth", map[string]any{"status": "denied"})
+			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusUnauthorized))
 			WriteError(w, requestID, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
 			return
 		}
 		emit(trace.Auth, "auth", map[string]any{"tenant_id": tenant.ID, "tier": tenant.Tier})
+		requestSpan.SetAttributes(otelattr.String("tenant_id", tenant.ID), otelattr.String("tier", tenant.Tier))
 
 		if allowed, retryAfter := p.RateLimit.Allow(tenant.ID, tenant.RPMLimit); !allowed {
 			emit(trace.RateLimit, "ratelimit", map[string]any{"tenant_id": tenant.ID, "retry_after": retryAfter})
@@ -114,10 +138,13 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			promptBytes += len(m.Content)
 		}
 		chatReq := core.ChatRequest{RequestID: requestID, TenantID: tenant.ID, Alias: body.Model, Tier: tenant.Tier, Messages: messages, Stream: body.Stream}
+		requestSpan.SetAttributes(otelattr.String("alias", body.Model))
 
 		period := time.Now().UTC().Format("2006-01")
 		estimated := budget.EstimateTokens(promptBytes, 0)
-		reservation, err := p.Budget.Reserve(ctx, tenant.ID, period, estimated, tenant.MonthlyTokenBudget)
+		reserveCtx, reserveSpan := tracer.Start(ctx, "budget.reserve")
+		reservation, err := p.Budget.Reserve(reserveCtx, tenant.ID, period, estimated, tenant.MonthlyTokenBudget)
+		reserveSpan.End()
 		if err != nil {
 			emit(trace.BudgetReserve, "budget", map[string]any{"tenant_id": tenant.ID, "status": "denied"})
 			if errors.Is(err, budget.ErrBudgetExceeded) {
@@ -150,9 +177,11 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		errorClass := ""
 		defer func() {
 			realTokens := respUsage.PromptTokens + respUsage.CompletionTokens
+			_, settleSpan := tracer.Start(traceCtx, "budget.settle")
 			if err := p.Budget.Settle(traceCtx, reservation, realTokens); err != nil {
 				slog.Error("budget: failed to settle reservation", "request_id", requestID, "error", err.Error())
 			}
+			settleSpan.End()
 			emit(trace.BudgetSettle, "budget", map[string]any{"tenant_id": tenant.ID, "real_tokens": realTokens})
 			latencyMs := int(time.Since(start).Milliseconds())
 			if p.Usage != nil {
@@ -186,7 +215,9 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 				// failures — including this timeout — are logged and traced,
 				// never surfaced to the caller.
 				publishCtx, cancelPublish := context.WithTimeout(traceCtx, 3*time.Second)
+				publishCtx, publishSpan := tracer.Start(publishCtx, "usage.publish")
 				err := p.Usage.Publish(publishCtx, event)
+				publishSpan.End()
 				cancelPublish()
 				if err != nil {
 					slog.Error("usage: failed to publish usage event", "request_id", requestID, "error", err.Error())
@@ -200,7 +231,9 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			}
 		}()
 
+		_, routeSpan := tracer.Start(ctx, "route")
 		targets, err := router.Resolve(p.Routing, body.Model, tenant.Tier)
+		routeSpan.End()
 		if err != nil {
 			emit(trace.Route, "router", map[string]any{"status": "error"})
 			status = "error"
@@ -211,13 +244,14 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 		emit(trace.Route, "router", map[string]any{"targets": len(targets)})
 
 		if body.Stream {
-			serveStreamPipeline(w, r, p, targets, chatReq, requestID, &respUsage, &target, &attempts, &ttftMs, &status, &errorClass, emit)
+			serveStreamPipeline(w, r, p, tracer, targets, chatReq, requestID, &respUsage, &target, &attempts, &ttftMs, &status, &errorClass, emit)
 			return
 		}
 
 		var resp core.ChatResponse
 		resp, target, attempts, err = resilience.Call(ctx, toBackends(p.Backends), targets, chatReq)
-		for _, a := range attempts {
+		for i, a := range attempts {
+			traceBackendCallSpan(ctx, tracer, i, a)
 			emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 		}
 		if err != nil {
@@ -235,12 +269,44 @@ func NewPipelineChatHandler(p *Pipeline) http.Handler {
 			emit(trace.Error, "resilience", map[string]any{"reason": "all_backends_failed"})
 			status = "error"
 			errorClass = errorClassFromAttempts(attempts)
+			requestSpan.SetAttributes(otelattr.Int("http.status_code", http.StatusBadGateway), otelattr.String("error.class", errorClass))
+			if p.Metrics != nil {
+				metricAttrs := metric.WithAttributes(
+					otelattr.String("route", body.Model),
+					otelattr.String("model", body.Model),
+					otelattr.String("tenant", tenant.ID),
+					otelattr.String("status", status),
+				)
+				p.Metrics.RequestsTotal.Add(ctx, 1, metricAttrs)
+				p.Metrics.LatencyMs.Record(ctx, float64(time.Since(start).Milliseconds()), metricAttrs)
+			}
 			writeAllBackendsFailed(w, requestID, attempts)
 			return
 		}
 		emit(trace.BackendResult, "resilience", map[string]any{"provider": target.Provider, "model": target.Model, "status": "ok", "prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens})
 
 		respUsage = resp.Usage
+		requestSpan.SetAttributes(
+			otelattr.String("provider", target.Provider),
+			otelattr.String("model", target.Model),
+			otelattr.Int("http.status_code", http.StatusOK),
+		)
+		if p.Metrics != nil {
+			metricAttrs := metric.WithAttributes(
+				otelattr.String("route", body.Model),
+				otelattr.String("model", target.Model),
+				otelattr.String("tenant", tenant.ID),
+				otelattr.String("status", status),
+			)
+			p.Metrics.RequestsTotal.Add(ctx, 1, metricAttrs)
+			p.Metrics.LatencyMs.Record(ctx, float64(time.Since(start).Milliseconds()), metricAttrs)
+			p.Metrics.TokensTotal.Add(ctx, int64(resp.Usage.PromptTokens), metric.WithAttributes(
+				otelattr.String("route", body.Model), otelattr.String("model", target.Model), otelattr.String("tenant", tenant.ID), otelattr.String("kind", "prompt"),
+			))
+			p.Metrics.TokensTotal.Add(ctx, int64(resp.Usage.CompletionTokens), metric.WithAttributes(
+				otelattr.String("route", body.Model), otelattr.String("model", target.Model), otelattr.String("tenant", tenant.ID), otelattr.String("kind", "completion"),
+			))
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -260,6 +326,24 @@ func isClientCancelled(ctx context.Context, err error) bool {
 		errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
+// traceBackendCallSpan records one "backend.call" child span per resilience
+// attempt, carrying only metadata (provider/model/attempt index/status) —
+// never request/response content.
+func traceBackendCallSpan(ctx context.Context, tracer oteltrace.Tracer, index int, a resilience.Attempt) {
+	attemptStatus := "ok"
+	if a.Err != nil {
+		attemptStatus = "error"
+	}
+	_, span := tracer.Start(ctx, "backend.call")
+	span.SetAttributes(
+		otelattr.String("provider", a.Provider),
+		otelattr.String("model", a.Model),
+		otelattr.Int("attempt", index+1),
+		otelattr.String("status", attemptStatus),
+	)
+	span.End()
+}
+
 // serveStreamPipeline runs the streaming cascade through resilience.CallStream,
 // forwarding every chunk to the client as SSE as it arrives. Because the SSE
 // headers (200 + text/event-stream) are already flushed before any backend is
@@ -272,7 +356,7 @@ func isClientCancelled(ctx context.Context, err error) bool {
 // usage is filled in from the final reported core.Usage (prompt/completion
 // split intact) so the caller's deferred budget.Settle and usage_publish see
 // real, not estimated, numbers.
-func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, outTarget *core.BackendTarget, outAttempts *[]resilience.Attempt, outTTFTMs *int, outStatus *string, outErrorClass *string, emit func(trace.EventType, string, map[string]any)) {
+func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, tracer oteltrace.Tracer, targets []core.BackendTarget, chatReq core.ChatRequest, requestID string, usage *core.Usage, outTarget *core.BackendTarget, outAttempts *[]resilience.Attempt, outTTFTMs *int, outStatus *string, outErrorClass *string, emit func(trace.EventType, string, map[string]any)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		WriteError(w, requestID, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support flushing")
@@ -314,7 +398,8 @@ func serveStreamPipeline(w http.ResponseWriter, r *http.Request, p *Pipeline, ta
 	}
 
 	result, attempts, streamErr := resilience.CallStream(r.Context(), targets, resolve, chatReq, onChunk)
-	for _, a := range attempts {
+	for i, a := range attempts {
+		traceBackendCallSpan(r.Context(), tracer, i, a)
 		emit(trace.BackendAttempt, "resilience", attemptPayload(a))
 	}
 	*usage = result
