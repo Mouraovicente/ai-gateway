@@ -133,7 +133,9 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 	go func() {
 		for range chunks {
 		}
-		<-errs
+		if err := <-errs; err != nil {
+			t.Log(err)
+		}
 		close(done)
 	}()
 
