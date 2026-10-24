@@ -215,7 +215,9 @@ func TestChatStream_ConsumerCancelsAfterFirstDelta_NoGoroutineLeak(t *testing.T)
 			// loop exists only to detect channel close; real consumers may stop reading
 			// entirely, which is exactly the leak scenario the terminal-chunk fix covers.
 		}
-		<-errs
+		if err := <-errs; err != nil {
+			t.Log(err)
+		}
 		close(done)
 	}()
 
