@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Central config: applies to every repo that has no .coderabbit.yaml of its own.
+language: pt-BR
+
+reviews:
+  profile: chill
+  # Walkthrough: keep it open and with all sections (diagram, effort, related PRs/issues are on by default).
+  collapse_walkthrough: false
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    drafts: false
+  tools:
+    # Waits for GitHub Actions checks and comments on failures inline.
+    github-checks:
+      enabled: true
+
+chat:
+  art: false
